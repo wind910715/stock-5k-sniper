@@ -2,3 +2,6 @@ requests
 yfinance
 pandas
 pytz
+lxml
+beautifulsoup4
+urllib3
