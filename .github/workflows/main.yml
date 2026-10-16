@@ -2,13 +2,21 @@ name: 5K Volume Momentum Sniper
 
 on:
   schedule:
-    # 台灣時間週一至週五 09:00 ~ 13:35 (對應 UTC 時間 01:00 ~ 05:35)，每 5 分鐘執行一次
-    - cron: '*/5 1-5 * * 1-5'
-  workflow_dispatch: # 保留手動測試按鈕
+    # 1. 主力常駐排程：台灣時間週一至週五 08:55 啟動 (UTC 00:55)，一鏡到底常駐跑到 13:35 收盤！
+    - cron: '55 0 * * 1-5'
+    # 2. 備援喚醒排程：萬一盤中手動修改程式碼或中斷，每小時整點自動檢查並無縫接手
+    - cron: '0 1-5 * * 1-5'
+  workflow_dispatch: # 隨時可手動點擊測試
+
+# 防止多個排程同時撞車：若已經有一台常駐雷達在跑，新的排程就不會重複打斷它
+concurrency:
+  group: tw-stock-5k-sniper
+  cancel-in-progress: false
 
 jobs:
   scan-market:
     runs-on: ubuntu-latest
+    timeout-minutes: 330 # 給予最長 5.5 小時不斷電執行權限 (涵蓋 08:55 ~ 13:35 全場)
     steps:
       - name: 1. 檢出程式碼
         uses: actions/checkout@v4
@@ -24,9 +32,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 4. 執行 5K 爆量偵測腳本
+      - name: 4. 啟動 5K 極速常駐雷達
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python bot.py
+          python -u bot.py
