@@ -1,20 +1,25 @@
 import os
+import time
 from datetime import datetime
 import pytz
 import requests
-import yfinance as yf
+import urllib3
 import pandas as pd
+import yfinance as yf
+
+# 關閉爬蟲抓證交所時的 SSL 警告訊息
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 讀取 GitHub Secrets 金鑰
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# 監控股票清單（上市加 .TW，上櫃加 .TWO）
-# 建議放入您的核心觀察股或高波動中小型股
-WATCHLIST = [
-    "2330.TW", "2454.TW", "2383.TW", "3711.TW", 
-    "2317.TW", "3037.TW", "3017.TW", "3661.TW"
-]
+# ==================== 策略參數設定區 ====================
+VOL_MULTIPLIER = 3.0   # 爆量倍數門檻：單根 5K 成交量 >= 過去 5 日 5K 均量的 3 倍
+PCT_THRESHOLD = 2.0    # 瞬間漲幅門檻：單根 5K 瞬間急拉 >= 2.0%
+MIN_5K_LOTS = 100      # 最低流動性過濾：該根 5K 成交量至少要 >= 100 張 (避免冷門殭屍股 1張變3張 誤報)
+BATCH_SIZE = 200       # 每批次同時下載的檔數 (200 檔最穩定且速度最快)
+# ========================================================
 
 def send_telegram(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -27,99 +32,192 @@ def send_telegram(message):
         "parse_mode": "Markdown"
     }
     try:
-        res = requests.post(url, json=payload, timeout=10)
+        res = requests.post(url, json=payload, timeout=15)
         if res.status_code != 200:
             print(f"Telegram 發送失敗: {res.text}")
     except Exception as e:
         print(f"連線 Telegram 發生異常: {e}")
 
-def scan_5k_momentum():
+def get_all_tw_stocks():
+    """
+    自動從台灣證交所與櫃買中心抓取全市場上市櫃個股與全數 ETF (含主動式 ETF)
+    回傳格式: dict -> {'2330.TW': '台積電', '00981A.TW': '...', ...}
+    """
+    stock_dict = {}
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    
+    # 2: 上市 (TWSE), 4: 上櫃 (TPEx)
+    modes = [('2', '.TW'), ('4', '.TWO')]
+    
+    for mode, suffix in modes:
+        url = f"https://isin.twse.com.tw/isin/C_public.jsp?strMode={mode}"
+        try:
+            res = requests.get(url, headers=headers, verify=False, timeout=15)
+            res.encoding = 'big5'
+            dfs = pd.read_html(res.text)
+            df = dfs[0]
+            df.columns = df.iloc[0]
+            df = df.iloc[1:]
+            
+            # 確保欄位存在
+            if 'CFICode' in df.columns and '有價證券代號及名稱' in df.columns:
+                # ESVUFR: 上市櫃普通股 | CEO***: 各類 ETF (被動型、主動型、槓桿型、債券型皆為 CEO 開頭)
+                cond = (df['CFICode'] == 'ESVUFR') | (df['CFICode'].astype(str).str.startswith('CEO'))
+                valid_df = df[cond]
+                
+                for item in valid_df['有價證券代號及名稱']:
+                    parts = str(item).replace('\u3000', ' ').split()
+                    if len(parts) >= 2:
+                        code, name = parts[0].strip(), parts[1].strip()
+                        # 過濾掉少數長度超過 6 碼的特殊憑證，保留 4~6 碼的個股與 ETF (如 2330, 00981A, 00631L)
+                        if 4 <= len(code) <= 6:
+                            stock_dict[f"{code}{suffix}"] = name
+        except Exception as e:
+            print(f"⚠️ 抓取市場清單 (Mode {mode}) 發生異常: {e}")
+
+    print(f"✅ 成功載入全市場清單：共 {len(stock_dict)} 檔上市櫃個股與 ETF")
+    return stock_dict
+
+def scan_full_market():
+    start_time = time.time()
     tz_tw = pytz.timezone("Asia/Taipei")
     now_tw = datetime.now(tz_tw)
-    print(f"[{now_tw.strftime('%Y-%m-%d %H:%M:%S')}] 啟動 5K 爆量急拉掃描...")
+    print(f"[{now_tw.strftime('%Y-%m-%d %H:%M:%S')}] 🚀 啟動全市場 5K 爆量急拉雷達...")
 
+    stock_dict = get_all_tw_stocks()
+    if not stock_dict:
+        print("❌ 無法取得股票清單，結束掃描。")
+        return
+
+    symbols = list(stock_dict.keys())
     alerts = []
 
-    for symbol in WATCHLIST:
+    # 將 2,100+ 檔股票切分為每批 200 檔進行併發下載
+    for i in range(0, len(symbols), BATCH_SIZE):
+        batch_symbols = symbols[i:i + BATCH_SIZE]
+        print(f"📡 正在掃描第 {i+1} ~ {min(i+BATCH_SIZE, len(symbols))} 檔...")
+        
         try:
-            stock = yf.Ticker(symbol)
-            # 抓取最近 6 天的 5 分 K 資料 (確保涵蓋完整過去 5 個交易日)
-            df = stock.history(period="6d", interval="5m")
+            # 批次下載最近 6 天的 5分K 資料 (開啟多執行緒加速)
+            data = yf.download(
+                tickers=batch_symbols,
+                period="6d",
+                interval="5m",
+                group_by="ticker",
+                threads=True,
+                progress=False
+            )
             
-            if df.empty or len(df) < 30:
+            if data.empty:
                 continue
 
-            # 轉換為台灣時區
-            if df.index.tz is None:
-                df.index = df.index.tz_localize("UTC").tz_convert(tz_tw)
-            else:
-                df.index = df.index.tz_convert(tz_tw)
+            for sym in batch_symbols:
+                try:
+                    # 取出單一股票的 DataFrame
+                    if len(batch_symbols) == 1:
+                        df = data
+                    else:
+                        if sym not in data.columns.get_level_values(0):
+                            continue
+                        df = data[sym]
 
-            # 【關鍵處理】若最後一根 5K 還在跳動未收線（距離現在小於 4.5 分鐘），
-            # 則取倒數第二根「剛收完線的完整 5K」來判斷，避免剛換分時成交量太小漏抓
-            last_bar_time = df.index[-1]
-            if (now_tw - last_bar_time).total_seconds() < 270 and len(df) > 2:
-                target_bar = df.iloc[-2]
-                prev_bar = df.iloc[-3]
-                history_df = df.iloc[:-2]
-            else:
-                target_bar = df.iloc[-1]
-                prev_bar = df.iloc[-2]
-                history_df = df.iloc[:-1]
+                    # 剔除沒有交易資料的空行
+                    df = df.dropna(subset=["Close", "Volume"])
+                    if len(df) < 30:
+                        continue
 
-            # 過濾掉歷史資料中成交量為 0 的異常 K 棒，取最近 270 根 5K (約 5 個交易日，每日 54 根 5K)
-            valid_history = history_df[history_df["Volume"] > 0].tail(270)
-            if len(valid_history) < 20:
-                continue
+                    # 轉換為台灣時區
+                    if df.index.tz is None:
+                        df.index = df.index.tz_localize("UTC").tz_convert(tz_tw)
+                    else:
+                        df.index = df.index.tz_convert(tz_tw)
 
-            # 1. 計算最近 5 日的「5K 平均成交量」
-            avg_5k_vol = valid_history["Volume"].mean()
-            current_5k_vol = target_bar["Volume"]
-            vol_ratio = current_5k_vol / avg_5k_vol if avg_5k_vol > 0 else 0
+                    # 【未收線保護機制】若最新一根 5K 還沒走滿 4.5 分鐘，取上一根完整收線的 5K
+                    last_bar_time = df.index[-1]
+                    if (now_tw - last_bar_time).total_seconds() < 270 and len(df) > 2:
+                        target_bar = df.iloc[-2]
+                        prev_bar = df.iloc[-3]
+                        history_df = df.iloc[:-2]
+                    else:
+                        target_bar = df.iloc[-1]
+                        prev_bar = df.iloc[-2]
+                        history_df = df.iloc[:-1]
 
-            # 2. 計算這根 5K 的「瞬間漲幅」：包含兩種計算取最大值
-            #    - 實體漲幅：(本根收盤 - 本根開盤) / 本根開盤
-            #    - 跳空連貫漲幅：(本根收盤 - 上一根收盤) / 上一根收盤
-            open_p = target_bar["Open"]
-            close_p = target_bar["Close"]
-            prev_close_p = prev_bar["Close"]
+                    # 只檢查「今天」產生的 K 棒 (避免收盤後或假日誤抓昨天的尾盤 K 棒)
+                    # 若您想在盤後手動按按鈕測試結果，可暫時把下面這兩行加上 # 註解掉
+                    if target_bar.name.date() != now_tw.date():
+                        continue
 
-            bar_body_pct = ((close_p - open_p) / open_p) * 100 if open_p > 0 else 0
-            bar_jump_pct = ((close_p - prev_close_p) / prev_close_p) * 100 if prev_close_p > 0 else 0
-            instant_pct = max(bar_body_pct, bar_jump_pct)
+                    # 計算單根 5K 成交張數 (1張 = 1000股)
+                    current_5k_vol = float(target_bar["Volume"])
+                    vol_lots = int(current_5k_vol / 1000)
 
-            bar_time_str = target_bar.name.strftime("%H:%M")
-            # 換算成台股習慣的「張數」（1張 = 1000股）
-            vol_lots = int(current_5k_vol / 1000)
-            avg_lots = int(avg_5k_vol / 1000)
+                    # 第一道過濾：5K 成交量小於設定張數 (預設 100 張) 直接略過，極速篩掉冷門股
+                    if vol_lots < MIN_5K_LOTS:
+                        continue
 
-            print(f"[{symbol}] {bar_time_str} | 現價:{close_p:.2f} | 5K瞬間漲幅:{instant_pct:.2f}% | 5K量:{vol_lots}張 (均量:{avg_lots}張, {vol_ratio:.1f}倍)")
+                    # 取出過去 5 個交易日有效的 5K 計算均量 (約 270 根)
+                    valid_history = history_df[history_df["Volume"] > 0].tail(270)
+                    if len(valid_history) < 20:
+                        continue
 
-            # 【觸發條件】：
-            # 1. 單根 5K 成交量 >= 過去 5 日 5K 均量的 3.0 倍
-            # 2. 單根 5K 瞬間漲幅 >= 2.0%
-            # 3. 必須為紅 K 或平盤上急拉 (收盤 >= 開盤)
-            if vol_ratio >= 3.0 and instant_pct >= 2.0 and close_p >= open_p:
-                alert_msg = (
-                    f"🔥 *【5K 爆量急拉警報】*\n"
-                    f"🎯 標的：`{symbol}`\n"
-                    f"⏰ K棒時間：`{bar_time_str}`\n"
-                    f"🚀 5K瞬間急拉：`+{instant_pct:.2f}%`\n"
-                    f"💥 5K爆量倍數：`{vol_ratio:.1f} 倍` (5日5K均量)\n"
-                    f"📊 本根成交量：`{vol_lots:,} 張` (均量 `{avg_lots:,} 張`)\n"
-                    f"💰 當前價格：`{close_p:.2f}`"
-                )
-                alerts.append(alert_msg)
+                    avg_5k_vol = float(valid_history["Volume"].mean())
+                    vol_ratio = current_5k_vol / avg_5k_vol if avg_5k_vol > 0 else 0
+
+                    # 計算 5K 瞬間漲幅 (取「實體K棒漲幅」與「對比前根收盤漲幅」之最大值)
+                    open_p = float(target_bar["Open"])
+                    close_p = float(target_bar["Close"])
+                    prev_close_p = float(prev_bar["Close"])
+
+                    bar_body_pct = ((close_p - open_p) / open_p) * 100 if open_p > 0 else 0
+                    bar_jump_pct = ((close_p - prev_close_p) / prev_close_p) * 100 if prev_close_p > 0 else 0
+                    instant_pct = max(bar_body_pct, bar_jump_pct)
+
+                    # 觸發條件：5K 量 >= 5日5K均量 3 倍 且 5K 瞬間急拉 >= 2% 且 為紅K
+                    if vol_ratio >= VOL_MULTIPLIER and instant_pct >= PCT_THRESHOLD and close_p >= open_p:
+                        clean_code = sym.replace(".TW", "").replace(".TWO", "")
+                        stock_name = stock_dict.get(sym, "")
+                        avg_lots = max(1, int(avg_5k_vol / 1000))
+                        bar_time_str = target_bar.name.strftime("%H:%M")
+
+                        alert_item = {
+                            "vol_ratio": vol_ratio,
+                            "msg": (
+                                f"🔥 *{clean_code} {stock_name}*\n"
+                                f"⏰ 時間：`{bar_time_str}` | 💰 現價：`{close_p:.2f}`\n"
+                                f"🚀 5K急拉：`+{instant_pct:.2f}%`\n"
+                                f"💥 5K爆量：`{vol_ratio:.1f} 倍` (`{vol_lots:,}`張 / 均量`{avg_lots:,}`張)"
+                            )
+                        }
+                        alerts.append(alert_item)
+
+                except Exception:
+                    continue
 
         except Exception as e:
-            print(f"處理 {symbol} 時發生錯誤: {e}")
+            print(f"批次下載發生異常: {e}")
 
+    elapsed = time.time() - start_time
+    print(f"🏁 全市場掃描完成！共耗時 {elapsed:.1f} 秒，偵測到 {len(alerts)} 檔符合條件。")
+
+    # 若有抓到爆量動能股，依照「爆量倍數」由大到小排序並推播至 Telegram
     if alerts:
-        header = f"⚡ *盤中 5K 動能雷達觸發 ({now_tw.strftime('%H:%M')})*\n\n"
-        send_telegram(header + "\n\n".join(alerts))
-        print("✅ 已推播警報至 Telegram！")
-    else:
-        print("掃描完畢，本時段無符合條件之標的。")
+        alerts.sort(key=lambda x: x["vol_ratio"], reverse=True)
+        
+        # Telegram 單則訊息有 4096 字元上限，每 15 檔切分成一則訊息發送最安全
+        chunk_size = 15
+        for idx in range(0, len(alerts), chunk_size):
+            chunk = alerts[idx:idx + chunk_size]
+            header = (
+                f"⚡ *【全市場 5K 爆量急拉雷達】*\n"
+                f"🕒 掃描時間：{now_tw.strftime('%H:%M')} (耗時 {elapsed:.0f}秒)\n"
+                f"📌 條件：5K量 > 5日均量 {VOL_MULTIPLIER}倍 & 5K急拉 > {PCT_THRESHOLD}%\n"
+                f"──────────────────\n\n"
+            )
+            body = "\n\n".join([item["msg"] for item in chunk])
+            send_telegram(header + body)
+            
+        print("✅ 已全數推播至 Telegram！")
 
 if __name__ == "__main__":
-    scan_5k_momentum()
+    scan_full_market()
