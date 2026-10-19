@@ -2,21 +2,23 @@ name: 5K Volume Momentum Sniper
 
 on:
   schedule:
-    # 1. 主力常駐排程：台灣時間週一至週五 08:55 啟動 (UTC 00:55)，一鏡到底常駐跑到 13:35 收盤！
-    - cron: '55 0 * * 1-5'
-    # 2. 備援喚醒排程：萬一盤中手動修改程式碼或中斷，每小時整點自動檢查並無縫接手
-    - cron: '0 1-5 * * 1-5'
-  workflow_dispatch: # 隨時可手動點擊測試
+    # 台灣時間週一至週五 08:35 提前啟動 (對應 UTC 00:35)
+    # 避開整點排程尖峰，於開盤前完成全市場均量預熱，一路常駐監控至 13:35 收盤！
+    - cron: '35 0 * * 1-5'
+  workflow_dispatch: # 隨時可手動點擊立刻接管執行
 
-# 防止多個排程同時撞車：若已經有一台常駐雷達在跑，新的排程就不會重複打斷它
+# 若手動點擊測試或觸發新排程，立刻終止舊的卡住任務並由新任務無縫接管，絕不排隊卡死
 concurrency:
   group: tw-stock-5k-sniper
-  cancel-in-progress: false
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   scan-market:
     runs-on: ubuntu-latest
-    timeout-minutes: 330 # 給予最長 5.5 小時不斷電執行權限 (涵蓋 08:55 ~ 13:35 全場)
+    timeout-minutes: 340 # 給予最長 5小時40分 執行權限 (涵蓋 08:35 ~ 13:35 全場)
     steps:
       - name: 1. 檢出程式碼
         uses: actions/checkout@v4
@@ -24,7 +26,7 @@ jobs:
       - name: 2. 安裝 Python 環境
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
           cache: 'pip'
 
       - name: 3. 安裝必要套件
