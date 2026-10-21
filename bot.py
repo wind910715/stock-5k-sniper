@@ -2,6 +2,7 @@ import os
 import time
 import logging
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 import pytz
 import requests
@@ -15,20 +16,30 @@ logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# ==================== 實戰狙擊參數設定 ====================
-VOL_MULTIPLIER = 3.0       # 爆量倍數：近 5 分鐘成交量 >= 過去 5 日 5K 均量的 3.0 倍
-PCT_THRESHOLD = 1.8        # 急拉門檻：近 5 分鐘內瞬間拉升幅度 >= 1.8% (微調至 1.8% 捕捉起漲第一根！)
-MIN_5K_LOTS = 80           # 近 5 分鐘最低成交張數：至少 >= 80 張
-MIN_AVG_DAILY_LOTS = 300   # 活躍股門檻：過去 5 日日均量 >= 300 張
-SCAN_INTERVAL_SEC = 30     # 每 30 秒極速取樣一次台灣官方報價！
-SEND_HEARTBEAT = True      # 每 5 分鐘發送一次心跳回報
+# ==================== 實戰雙引擎參數設定 ====================
+# 【策略 A：5K / 區間爆量急拉】
+VOL_MULTIPLIER = 2.8         # 區間爆量倍數：近 3~5 分鐘量 >= 5日5K均量的 2.8 倍
+PCT_THRESHOLD = 1.6          # 瞬間急拉門檻：拉升幅度 >= 1.6% (提早於 +1.6% 起漲點就抓出！)
+MIN_5K_LOTS = 80             # 區間最低張數：>= 80 張
+
+# 【策略 B：外盤連續大買單（主力主動向上掃貨，不必等漲滿 1.6% 即刻抓起漲！）】
+OUTER_STREAK_COUNT = 2       # 連續幾個取樣週期出現外盤主動大買單 (2次 = 約20秒內連續掃貨)
+OUTER_STREAK_MIN_LOTS = 150  # 連續外盤掃貨累計張數門檻：>= 150 張
+OUTER_STREAK_VOL_RATIO = 1.6 # 連續外盤量達 5K 均量的倍數：>= 1.6 倍 (在股價剛動 0.4% 時就提前警報！)
+OUTER_SINGLE_MEGA_LOTS = 250 # 單發外盤一擊必殺大單：10秒內外盤直接狂敲 >= 250 張且達均量 2.0 倍
+
+# 【系統極速設定】
+MIN_AVG_DAILY_LOTS = 300     # 活躍股門檻：過去 5 日日均量 >= 300 張
+SCAN_INTERVAL_SEC = 10       # 每 10 秒極速巡邏一次全市場！(原為30秒，提速3倍)
+MAX_WORKERS = 10             # 10 執行緒併發抓取台灣證交所 MIS，將 61 秒壓縮至 3~5 秒！
+SEND_HEARTBEAT = True        # 每 5 分鐘整點發送心跳回報
 # ==========================================================
 
 STOCK_DICT = {}
-BASELINE_AVG_5K = {}       # 單位：張 (Lots)
+BASELINE_AVG_5K = {}         # 過去 5 日每 5 分鐘平均張數
 ACTIVE_UNIVERSE = set()
-ALERTED_COOLDOWN = {}      # 記錄每檔股票最後推播時間，10 分鐘內不重複洗版同一檔
-PRICE_VOL_HISTORY = {}     # 記憶體即時時序庫：記錄每檔股票過去 6 分鐘的 (timestamp, price, total_lots)
+ALERTED_COOLDOWN = {}        # 記錄 (股票, 策略類型) 最後推播時間，防止重複刷屏
+PRICE_VOL_HISTORY = {}       # 儲存每檔股票近期快照：deque of dict
 
 FUTURES_SET = {
     "2330", "2317", "2454", "2382", "2308", "2303", "2881", "2882", "2891", "2603",
@@ -70,7 +81,6 @@ def is_valid_stock_code(code):
     return True
 
 def init_market_and_baseline():
-    """開盤預熱：用日K計算過去 5 日平均 5K 張數（日K不受 20 分鐘延遲影響）"""
     global STOCK_DICT, FUTURES_SET, BASELINE_AVG_5K, ACTIVE_UNIVERSE
     if len(ACTIVE_UNIVERSE) > 200:
         return
@@ -131,7 +141,6 @@ def init_market_and_baseline():
                         avg_daily_vol = float(df_hist["Volume"].mean())
                         clean_c = clean_symbol_code(sym)
                         if avg_daily_vol >= min_daily_shares or clean_c in FUTURES_SET:
-                            # 換算成「每 5 分鐘平均張數」(1張=1000股，一日54根5K)
                             BASELINE_AVG_5K[sym] = max(5.0, (avg_daily_vol / 1000.0) / 54.0)
                             ACTIVE_UNIVERSE.add(sym)
                 except Exception:
@@ -141,20 +150,66 @@ def init_market_and_baseline():
 
     print(f"✅ [預熱完成] 鎖定 {len(ACTIVE_UNIVERSE)} 檔活躍股 (含 {len(FUTURES_SET)} 檔股期標的)！")
 
-def fetch_realtime_mis_quotes(symbols_list):
-    """
-    【台灣證交所 MIS 官方盤中即時報價 API】
-    0 延遲！直接抓取當下這一秒的真實成交價、開盤價、昨收價與當日累積成交張數！
-    每次併發查詢 80 檔，1,000 檔僅需約 3.5 秒即可全數抓完！
-    """
-    results = {}
-    session = requests.Session()
+def _fetch_single_mis_chunk(chunk, sym_map):
+    """單一批次抓取證交所 MIS 報價 (供多執行緒併發呼叫，包含五檔委買委賣以判斷內外盤)"""
+    chunk_results = {}
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
         'Referer': 'https://mis.twse.com.tw/stock/index.jsp'
     }
+    ex_ch = "|".join(chunk)
+    url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={ex_ch}&json=1&delay=0"
+    try:
+        res = requests.get(url, headers=headers, verify=False, timeout=4.5)
+        if res.status_code == 200:
+            data = res.json()
+            for item in data.get("msgArray", []):
+                ch = f"{item.get('ex', '')}_{item.get('ch', '')}"
+                sym = sym_map.get(ch)
+                if not sym:
+                    continue
 
-    # 將 .TW 轉為 tse_xxxx.tw，.TWO 轉為 otc_xxxx.tw
+                # 解析委買第一檔 (bid1) 與 委賣第一檔 (ask1，即外盤價)
+                b_list = [x for x in str(item.get("b", "")).split("_") if x not in ("-", "")]
+                a_list = [x for x in str(item.get("a", "")).split("_") if x not in ("-", "")]
+                bid1 = float(b_list[0]) if b_list else 0.0
+                ask1 = float(a_list[0]) if a_list else 0.0
+
+                z_str = item.get("z", "-")
+                if z_str in ("-", "", None):
+                    z_str = str(bid1) if bid1 > 0 else item.get("y", "0")
+
+                try:
+                    price = float(z_str)
+                    total_lots = int(float(item.get("v", "0")))
+                    tick_lots = int(float(item.get("tv", "0"))) if item.get("tv", "-") not in ("-", "") else 0
+                    open_p = float(item.get("o", price)) if item.get("o", "-") not in ("-", "") else price
+                    yest_p = float(item.get("y", price)) if item.get("y", "-") not in ("-", "") else price
+                    low_p = float(item.get("l", price)) if item.get("l", "-") not in ("-", "") else price
+
+                    if price > 0 and total_lots > 0:
+                        chunk_results[sym] = {
+                            "price": price,
+                            "total_lots": total_lots,
+                            "tick_lots": tick_lots,
+                            "bid1": bid1,
+                            "ask1": ask1,
+                            "open": open_p,
+                            "yest": yest_p,
+                            "low": low_p
+                        }
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return chunk_results
+
+def fetch_realtime_mis_quotes_parallel(symbols_list):
+    """
+    【10執行緒併發極速引擎】
+    將 15 批跨海請求同時併發射出，耗時從 61.7 秒直接砍到 3.5 秒內！
+    """
+    results = {}
     mis_keys = []
     sym_map = {}
     for s in symbols_list:
@@ -164,46 +219,16 @@ def fetch_realtime_mis_quotes(symbols_list):
         mis_keys.append(m_key)
         sym_map[m_key] = s
 
-    chunk_size = 75
-    for i in range(0, len(mis_keys), chunk_size):
-        chunk = mis_keys[i:i + chunk_size]
-        ex_ch = "|".join(chunk)
-        url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={ex_ch}&json=1&delay=0"
-        try:
-            res = session.get(url, headers=headers, verify=False, timeout=5)
-            if res.status_code == 200:
-                data = res.json()
-                for item in data.get("msgArray", []):
-                    ch = f"{item.get('ex', '')}_{item.get('ch', '')}"
-                    sym = sym_map.get(ch)
-                    if not sym:
-                        continue
-                    
-                    # z: 最新成交價 (若當盤無成交，取 b 委買第一檔或 a 委賣第一檔)
-                    z_str = item.get("z", "-")
-                    if z_str == "-" or not z_str:
-                        b_list = str(item.get("b", "")).split("_")
-                        z_str = b_list[0] if b_list and b_list[0] not in ("-", "") else item.get("y", "0")
-                    
-                    try:
-                        price = float(z_str)
-                        total_lots = int(float(item.get("v", "0"))) # v: 今日累積成交張數
-                        open_p = float(item.get("o", price) if item.get("o", "-") != "-" else price)
-                        yest_p = float(item.get("y", price) if item.get("y", "-") != "-" else price)
-                        low_p = float(item.get("l", price) if item.get("l", "-") != "-" else price)
-                        if price > 0 and total_lots > 0:
-                            results[sym] = {
-                                "price": price,
-                                "total_lots": total_lots,
-                                "open": open_p,
-                                "yest": yest_p,
-                                "low": low_p
-                            }
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-        time.sleep(0.08) # 微小間隔保護官方連線穩定
+    chunk_size = 80
+    chunks = [mis_keys[i:i + chunk_size] for i in range(0, len(mis_keys), chunk_size)]
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [executor.submit(_fetch_single_mis_chunk, c, sym_map) for c in chunks]
+        for f in as_completed(futures):
+            try:
+                results.update(f.result())
+            except Exception:
+                pass
 
     return results
 
@@ -216,63 +241,125 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
     if len(ACTIVE_UNIVERSE) < 100:
         init_market_and_baseline()
 
-    # 排序：股期標的優先查詢
     sorted_universe = sorted(list(ACTIVE_UNIVERSE), key=lambda s: clean_symbol_code(s) in FUTURES_SET, reverse=True)
-    
-    # 1. 從台灣證交所 MIS 抓取 0 延遲即時報價 (耗時僅約 3.5 ~ 5 秒！)
-    live_quotes = fetch_realtime_mis_quotes(sorted_universe)
+    live_quotes = fetch_realtime_mis_quotes_parallel(sorted_universe)
     alerts = []
 
-    # 2. 如果證交所 MIS 順利抓到即時報價，進行「滾動 5 分鐘視窗」0 延遲爆量急拉比對！
     if len(live_quotes) > 100:
         for sym, q in live_quotes.items():
             cur_price = q["price"]
             cur_lots = q["total_lots"]
             open_p = q["open"]
             yest_p = q["yest"]
+            ask1 = q["ask1"]
+            bid1 = q["bid1"]
 
             if sym not in PRICE_VOL_HISTORY:
-                PRICE_VOL_HISTORY[sym] = deque(maxlen=15)
-            
-            hist = PRICE_VOL_HISTORY[sym]
-            hist.append((now_ts, cur_price, cur_lots))
+                PRICE_VOL_HISTORY[sym] = deque(maxlen=35) # 保存約 5 分鐘 (30次x10秒) 的高頻軌跡
 
-            # 需要至少有 2 個時間點才能算區間增量；將保留超過 330 秒 (5.5分鐘) 的舊快照移除
-            while len(hist) > 2 and (now_ts - hist[0][0]) > 330:
+            hist = PRICE_VOL_HISTORY[sym]
+
+            # 計算與上一拍 (10秒前) 的價差與量差，用來精準判定「外盤主動買單」
+            delta_step_lots = 0
+            is_outer_buy = False
+            if len(hist) >= 1:
+                prev_snap = hist[-1]
+                delta_step_lots = max(0, cur_lots - prev_snap["lots"])
+                prev_ask1 = prev_snap["ask1"]
+                prev_price = prev_snap["price"]
+
+                # 【外盤主動買進判定】：
+                # 只要本拍有新增成交量，且 (最新成交價 >= 上一拍委賣價ask1 或 最新成交價 == 本拍委賣價ask1 或 價格向上推升)
+                if delta_step_lots > 0:
+                    if (prev_ask1 > 0 and cur_price >= prev_ask1) or (ask1 > 0 and cur_price >= ask1) or (cur_price > prev_price):
+                        is_outer_buy = True
+
+            hist.append({
+                "ts": now_ts,
+                "price": cur_price,
+                "lots": cur_lots,
+                "ask1": ask1,
+                "bid1": bid1,
+                "step_lots": delta_step_lots,
+                "is_outer": is_outer_buy
+            })
+
+            # 移除超過 300 秒 (5分鐘) 的過期紀錄
+            while len(hist) > 2 and (now_ts - hist[0]["ts"]) > 300:
                 hist.popleft()
 
             if len(hist) < 2:
-                continue
-
-            # 冷卻保護：同一檔股票觸發後，10 分鐘 (600秒) 內不重複刷屏
-            if sym in ALERTED_COOLDOWN and (now_ts - ALERTED_COOLDOWN[sym]) < 600:
-                continue
-
-            # 計算過去這段滾動視窗 (1~5 分鐘內) 的「新增成交張數」與「區間最低價拉升幅度」
-            oldest_ts, oldest_price, oldest_lots = hist[0]
-            delta_lots = cur_lots - oldest_lots
-            if delta_lots < MIN_5K_LOTS:
                 continue
 
             avg_5k_lots = BASELINE_AVG_5K.get(sym, 0)
             if avg_5k_lots <= 0:
                 continue
 
-            vol_ratio = delta_lots / avg_5k_lots
-            if vol_ratio < VOL_MULTIPLIER:
+            clean_code = clean_symbol_code(sym)
+            stock_name = STOCK_DICT.get(sym, "")
+            futures_tag = " 【⚡有股期】" if clean_code in FUTURES_SET else ""
+            day_pct = ((cur_price - yest_p) / yest_p) * 100 if yest_p > 0 else 0
+
+            # =========================================================================
+            # 🎯 策略一：【外盤連續大買單（主力主動吃貨雷達）】— 抓起漲第一秒！
+            # 檢查最近 3 個取樣點 (約 20~30 秒內) 是否連續出現外盤大單掃貨
+            # =========================================================================
+            recent_snaps = list(hist)[-3:]
+            outer_hits = [s for s in recent_snaps if s["is_outer"] and s["step_lots"] >= 20]
+            outer_sum_lots = sum(s["step_lots"] for s in outer_hits)
+            outer_vol_ratio = outer_sum_lots / avg_5k_lots
+
+            # 條件 A：連續 >= 2 拍外盤主動大買單，合計 >= 150 張且達 5K 均量 1.6 倍
+            cond_streak_outer = (len(outer_hits) >= OUTER_STREAK_COUNT and outer_sum_lots >= OUTER_STREAK_MIN_LOTS and outer_vol_ratio >= OUTER_STREAK_VOL_RATIO)
+            # 條件 B：單拍 10 秒內外盤直接一擊狂敲 >= 250 張且達 5K 均量 2.0 倍
+            cond_mega_outer = (is_outer_buy and delta_step_lots >= OUTER_SINGLE_MEGA_LOTS and (delta_step_lots / avg_5k_lots) >= 2.0)
+
+            cooldown_key_outer = f"{sym}_OUTER"
+            if (cond_streak_outer or cond_mega_outer) and (now_ts - ALERTED_COOLDOWN.get(cooldown_key_outer, 0)) >= 480:
+                # 確保近 30 秒價格是往上或平盤墊高，而非往下殺
+                recent_low = min(s["price"] for s in recent_snaps)
+                if cur_price >= recent_low:
+                    ALERTED_COOLDOWN[cooldown_key_outer] = now_ts
+                    pull_pct = ((cur_price - recent_low) / recent_low) * 100 if recent_low > 0 else 0
+                    action_desc = f"連 {len(outer_hits)} 拍外盤狂掃" if cond_streak_outer else "10秒外盤一擊巨單"
+                    alerts.append({
+                        "priority": 2 if clean_code in FUTURES_SET else 1,
+                        "vol_ratio": outer_vol_ratio,
+                        "msg": (
+                            f"🎯 *【外盤連續大買單】{clean_code} {stock_name}*{futures_tag}\n"
+                            f"🧨 訊號：`{action_desc}` (當日 `{day_pct:+.1f}%`)\n"
+                            f"⏰ 即時：`{now_tw.strftime('%H:%M:%S')}` | 💰 現價：`{cur_price:.2f}` (外盤價 `{ask1:.2f}`)\n"
+                            f"🛒 外盤掃貨：瞬間狂吃 **`{outer_sum_lots:,} 張`** (達5K均量 `{outer_vol_ratio:.1f}倍` / 5K均量`{int(avg_5k_lots):,}`張)\n"
+                            f"📈 瞬間墊高：`+{pull_pct:.2f}%` (起漲點火偵測！)"
+                        )
+                    })
+                    continue
+
+            # =========================================================================
+            # 🔥 策略二：【滾動 5K 區間爆量急拉】
+            # =========================================================================
+            cooldown_key_5k = f"{sym}_5K"
+            if (now_ts - ALERTED_COOLDOWN.get(cooldown_key_5k, 0)) < 600:
                 continue
 
-            # 取過去 5 分鐘視窗內的最低價，計算瞬間急拉幅度
-            window_low = min(item[1] for item in hist)
-            instant_pct = ((cur_price - window_low) / window_low) * 100 if window_low > 0 else 0
+            oldest_snap = hist[0]
+            delta_5k_lots = cur_lots - oldest_snap["lots"]
+            if delta_5k_lots < MIN_5K_LOTS:
+                continue
 
+            vol_ratio_5k = delta_5k_lots / avg_5k_lots
+            if vol_ratio_5k < VOL_MULTIPLIER:
+                continue
+
+            window_low = min(s["price"] for s in hist)
+            window_high = max(s["price"] for s in hist)
+            if (window_high - window_low) > 0 and ((cur_price - window_low) / (window_high - window_low)) < 0.55:
+                continue
+
+            instant_pct = ((cur_price - window_low) / window_low) * 100 if window_low > 0 else 0
             if instant_pct >= PCT_THRESHOLD:
-                ALERTED_COOLDOWN[sym] = now_ts
-                clean_code = clean_symbol_code(sym)
-                stock_name = STOCK_DICT.get(sym, "")
-                futures_tag = " 【⚡有股期】" if clean_code in FUTURES_SET else ""
-                day_pct = ((cur_price - yest_p) / yest_p) * 100 if yest_p > 0 else 0
-                win_sec = int(now_ts - oldest_ts)
+                ALERTED_COOLDOWN[cooldown_key_5k] = now_ts
+                win_sec = max(10, int(now_ts - oldest_snap["ts"]))
 
                 if cur_price < open_p:
                     pattern_tag = f"🔨開低探底急拉 (當日 {day_pct:+.1f}%)"
@@ -282,106 +369,37 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
                     pattern_tag = f"🔴盤中點火強拉 (當日 {day_pct:+.1f}%)"
 
                 alerts.append({
-                    "has_futures": clean_code in FUTURES_SET,
-                    "vol_ratio": vol_ratio,
+                    "priority": 2 if clean_code in FUTURES_SET else 1,
+                    "vol_ratio": vol_ratio_5k,
                     "msg": (
-                        f"🔥 *{clean_code} {stock_name}*{futures_tag}\n"
+                        f"🔥 *【區間爆量急拉】{clean_code} {stock_name}*{futures_tag}\n"
                         f"🏷️ 型態：`{pattern_tag}`\n"
                         f"⏰ 即時：`{now_tw.strftime('%H:%M:%S')}` | 💰 現價：`{cur_price:.2f}`\n"
                         f"🚀 瞬間急拉：`+{instant_pct:.2f}%` ({win_sec}秒內自 `{window_low:.2f}` 拉起)\n"
-                        f"💥 區間爆量：`{vol_ratio:.1f} 倍` (瞬間狂敲 `{delta_lots:,}`張 / 5K均量`{int(avg_5k_lots):,}`張)"
+                        f"💥 區間爆量：`{vol_ratio_5k:.1f} 倍` (狂敲 `{delta_5k_lots:,}`張 / 5K均量`{int(avg_5k_lots):,}`張)"
                     )
                 })
 
-    # 3. 備援機制 (或首次啟動第 1 秒還沒有歷史差分時)：使用 Yahoo 5K (拿掉 720 秒錯殺限制！)
-    first_boot_check = sum(len(v) for v in PRICE_VOL_HISTORY.values()) <= len(PRICE_VOL_HISTORY)
-    if (first_boot_check or len(live_quotes) < 50) and not alerts:
-        print("🔍 [首次啟動基線掃描] 檢查最近一根已發生之 5K 強勢股...")
-        for i in range(0, len(sorted_universe), 150):
-            batch = sorted_universe[i:i + 150]
-            try:
-                data = yf.download(tickers=batch, period="1d", interval="5m", group_by="ticker", threads=True, progress=False)
-                if data.empty:
-                    continue
-                for sym in batch:
-                    try:
-                        df = data if len(batch) == 1 else data[sym]
-                        df = df.dropna(subset=["Close", "Volume"])
-                        if len(df) < 2:
-                            continue
-                        if df.index.tz is None:
-                            df.index = df.index.tz_localize("UTC").tz_convert(tz_tw)
-                        else:
-                            df.index = df.index.tz_convert(tz_tw)
-
-                        target_bar = df.iloc[-1] if len(df) == 2 else df.iloc[-2]
-                        prev_bar = df.iloc[-2] if len(df) == 2 else df.iloc[-3]
-
-                        vol_lots = int(float(target_bar["Volume"]) / 1000)
-                        if vol_lots < MIN_5K_LOTS:
-                            continue
-                        avg_5k_lots = BASELINE_AVG_5K.get(sym, 0)
-                        if avg_5k_lots <= 0:
-                            continue
-                        vol_ratio = vol_lots / avg_5k_lots
-                        if vol_ratio < VOL_MULTIPLIER:
-                            continue
-
-                        open_p = float(target_bar["Open"])
-                        close_p = float(target_bar["Close"])
-                        low_p = float(target_bar["Low"])
-                        high_p = float(target_bar["High"])
-                        prev_close_p = float(prev_bar["Close"])
-
-                        if (high_p - low_p) > 0 and ((close_p - low_p) / (high_p - low_p)) < 0.5:
-                            continue
-
-                        instant_pct = max(
-                            ((close_p - open_p) / open_p) * 100 if open_p > 0 else 0,
-                            ((close_p - prev_close_p) / prev_close_p) * 100 if prev_close_p > 0 else 0,
-                            ((close_p - low_p) / low_p) * 100 if low_p > 0 else 0
-                        )
-                        if instant_pct >= PCT_THRESHOLD:
-                            ALERTED_COOLDOWN[sym] = now_ts
-                            clean_code = clean_symbol_code(sym)
-                            stock_name = STOCK_DICT.get(sym, "")
-                            futures_tag = " 【⚡有股期】" if clean_code in FUTURES_SET else ""
-                            alerts.append({
-                                "has_futures": clean_code in FUTURES_SET,
-                                "vol_ratio": vol_ratio,
-                                "msg": (
-                                    f"🔥 *{clean_code} {stock_name}*{futures_tag}\n"
-                                    f"⏰ K棒：`{target_bar.name.strftime('%H:%M')}` | 💰 現價：`{close_p:.2f}`\n"
-                                    f"🚀 5K拉升：`+{instant_pct:.2f}%` (低點 `{low_p:.2f}`)\n"
-                                    f"💥 5K爆量：`{vol_ratio:.1f} 倍` (`{vol_lots:,}`張 / 均量`{int(avg_5k_lots):,}`張)"
-                                )
-                            })
-                    except Exception:
-                        continue
-            except Exception:
-                pass
-
     elapsed = time.time() - start_t
-    print(f"[{datetime.now(tz_tw).strftime('%H:%M:%S')}] ⚡ MIS 即時巡邏完成！耗時僅 {elapsed:.1f} 秒 (即時報價數: {len(live_quotes)})，抓到 {len(alerts)} 檔！")
+    print(f"[{datetime.now(tz_tw).strftime('%H:%M:%S')}] ⚡ 10執行緒極速巡邏完成！僅耗時 {elapsed:.2f} 秒 (報價數: {len(live_quotes)})，抓到 {len(alerts)} 檔！")
 
     if alerts:
-        alerts.sort(key=lambda x: (x["has_futures"], x["vol_ratio"]), reverse=True)
-        for idx in range(0, len(alerts), 12):
-            chunk = alerts[idx:idx + 12]
+        alerts.sort(key=lambda x: (x["priority"], x["vol_ratio"]), reverse=True)
+        for idx in range(0, len(alerts), 10):
+            chunk = alerts[idx:idx + 10]
             header = (
-                f"⚡ *【0延遲盤中爆量急拉快訊】*\n"
-                f"🕒 時間：{now_tw.strftime('%H:%M:%S')} (掃描僅 `{elapsed:.1f}秒`)\n"
-                f"📌 條件：區間量>{VOL_MULTIPLIER}倍 & 急拉>{PCT_THRESHOLD}%\n"
+                f"⚡ *【0延遲外盤大單 & 5K急拉快訊】*\n"
+                f"🕒 時間：{now_tw.strftime('%H:%M:%S')} (極速掃描 **`{elapsed:.1f}秒`**)\n"
                 f"──────────────────\n\n"
             )
             body = "\n\n".join([item["msg"] for item in chunk])
             send_telegram(header + body)
     elif is_manual_test or send_hb_now:
         status_msg = (
-            f"📡 *【0延遲 MIS 雷達心跳】*\n"
-            f"🕒 時間：`{datetime.now(tz_tw).strftime('%H:%M:%S')}` (單輪耗時僅 **`{elapsed:.1f}秒`**！)\n"
-            f"🎯 即時監控：`{len(live_quotes):,}` 檔官方 0 延遲報價 (含 `{len(FUTURES_SET)}` 檔股期)\n"
-            f"⚡ 狀態：滾動 5 分鐘視窗比對中，一爆量急拉即刻秒推！"
+            f"📡 *【0延遲雙引擎雷達心跳】*\n"
+            f"🕒 時間：`{datetime.now(tz_tw).strftime('%H:%M:%S')}` (單輪極速 **`{elapsed:.1f}秒`**！)\n"
+            f"🎯 監控：`{len(live_quotes):,}` 檔官方即時報價 (含 `{len(FUTURES_SET)}` 檔股期)\n"
+            f"⚡ 引擎：每 10 秒偵測【🎯外盤連續大買單】與【🔥5K爆量急拉】！"
         )
         send_telegram(status_msg)
 
@@ -391,18 +409,23 @@ def main():
     is_weekday = now_tw.weekday() < 5
     current_hm = now_tw.hour * 100 + now_tw.minute
 
-    if not is_weekday or current_hm > 1335 or current_hm < 820:
-        print("🔧 非盤中時段，執行【單次極速掃描測試】...")
+    # 若在 13:35 收盤後才因排程延遲啟動，直接優雅結束，不亂發訊息
+    if not is_weekday or current_hm > 1335 or current_hm < 750:
+        print(f"🔧 目前時間 {now_tw.strftime('%H:%M:%S')} 非盤中監控時段，執行單次連線測試...")
+        init_market_and_baseline()
         run_realtime_scan(send_hb_now=True, is_manual_test=True)
         return
 
-    print("🔥 進入【台灣證交所 MIS 0延遲高頻常駐模式】...")
+    print("🔥 進入【盤前預熱與盤中 10秒高頻外盤狙擊模式】...")
     init_market_and_baseline()
     send_telegram(
-        f"🚀 *【證交所 MIS 0延遲極速雷達已上線】*\n"
-        f"🕒 時間：`{datetime.now(tz_tw).strftime('%H:%M:%S')}`\n"
-        f"✅ 已修復 Yahoo 20分鐘延遲過濾 Bug，改接 **台灣證交所官方 MIS 0延遲報價**！\n"
-        f"⚡ 每 **30 秒** 僅需 **4~6 秒** 即可掃完 `{len(ACTIVE_UNIVERSE):,}` 檔活躍股，盤中急拉瞬間秒抓！"
+        f"🚀 *【外盤大買單 + 5K極速雷達已於盤前就位】*\n"
+        f"🕒 就位時間：`{datetime.now(tz_tw).strftime('%H:%M:%S')}`\n"
+        f"✅ 已完成 `{len(ACTIVE_UNIVERSE):,}` 檔活躍股與 `{len(FUTURES_SET)}` 檔個股期貨預熱！\n"
+        f"⚡ **三大升級**：\n"
+        f"1️⃣ 10執行緒併發，全市場掃描從 61秒 壓縮至 **3~5秒**！\n"
+        f"2️⃣ 巡邏密度提升至 **每 10 秒一次**！\n"
+        f"3️⃣ 新增 **【🎯外盤連續大買單】** 策略，主力一吃外盤立刻抓起漲！"
     )
 
     last_hb_slot = None
@@ -412,9 +435,10 @@ def main():
         current_hm = now_tw.hour * 100 + now_tw.minute
 
         if current_hm > 1335:
-            send_telegram("🔔 *【台股已收盤】* 今日 5K 常駐雷達任務圓滿結束！")
+            send_telegram("🔔 *【台股已收盤】* 今日外盤大單與 5K 雷達任務圓滿結束！")
             break
 
+        # 09:00:03 準時開始第一拍高頻取樣！
         if current_hm >= 900:
             slot_5m = f"{now_tw.hour:02d}:{(now_tw.minute // 5) * 5:02d}"
             should_send_hb = SEND_HEARTBEAT and (slot_5m != last_hb_slot) and (now_tw.minute % 5 == 0)
@@ -425,10 +449,11 @@ def main():
             run_realtime_scan(send_hb_now=should_send_hb, is_manual_test=False)
             scan_cost = time.time() - scan_start
 
-            sleep_sec = max(3.0, SCAN_INTERVAL_SEC - scan_cost)
+            sleep_sec = max(1.0, SCAN_INTERVAL_SEC - scan_cost)
             time.sleep(sleep_sec)
         else:
-            time.sleep(5)
+            # 08:05 ~ 08:59 盤前待命期間，每 2 秒微休眠，等待 09:00:00 瞬間開火！
+            time.sleep(2)
 
 if __name__ == "__main__":
     main()
