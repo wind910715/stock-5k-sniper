@@ -33,6 +33,13 @@ MIN_AVG_DAILY_LOTS = 300     # 活躍股門檻：過去 5 日日均量 >= 300 �
 SCAN_INTERVAL_SEC = 10       # 每 10 秒極速巡邏一次全市場！(原為30秒，提速3倍)
 MAX_WORKERS = 10             # 10 執行緒併發抓取台灣證交所 MIS，將 61 秒壓縮至 3~5 秒！
 SEND_HEARTBEAT = True        # 每 5 分鐘整點發送心跳回報
+
+# 【去雜訊防護】2026-10-24 審查加入：皆為結構性防護 (非門檻調參)，可個別以數值關閉
+MIN_5K_WINDOW_COVERAGE_SEC = 240  # 策略A：取樣視窗須涵蓋 >= 240 秒才判定，避免拿 20~60 秒的量去除 5 分鐘均量基準 (設 0 關閉)
+OUTER_MAX_STEP_GAP_SEC = 30       # 策略B：與上一拍間隔 > 30 秒的量差視為「累積量」(斷線/稀疏成交)，不算 10 秒掃貨 (設極大值可關閉)
+OUTER_STREAK_WINDOW_SEC = 60      # 策略B：「連續」外盤的取樣點必須落在最近 60 秒內，跨數分鐘的零星外盤不算連續
+GLOBAL_STOCK_ALERT_COOLDOWN_SEC = 300  # 同一檔股票任一策略推播後，300 秒內不推另一策略 (同一波行情不重複轟炸，設 0 關閉)
+MAX_ALERTS_PER_STOCK_PER_DAY = 5  # 同一檔股票單日推播上限 (兩策略合計，設 0 不限制)
 # ==========================================================
 
 STOCK_DICT = {}
@@ -40,6 +47,8 @@ BASELINE_AVG_5K = {}         # 過去 5 日每 5 分鐘平均張數
 ACTIVE_UNIVERSE = set()
 ALERTED_COOLDOWN = {}        # 記錄 (股票, 策略類型) 最後推播時間，防止重複刷屏
 PRICE_VOL_HISTORY = {}       # 儲存每檔股票近期快照：deque of dict
+LAST_ALERT_ANY = {}          # 每檔股票「任一策略」最後推播時間 (跨策略去重)
+ALERT_COUNT_TODAY = {}       # 每檔股票當日推播次數 (程序每日重啟，天然以日為界)
 
 FUTURES_SET = {
     "2330", "2317", "2454", "2382", "2308", "2303", "2881", "2882", "2891", "2603",
@@ -131,7 +140,9 @@ def init_market_and_baseline():
                 continue
             for sym in batch:
                 try:
-                    df_d = data_d if len(batch) == 1 else data_d[sym]
+                    # group_by="ticker" 時 columns 恆為 MultiIndex (含批次只有 1 檔時)，一律以 sym 取欄；
+                    # 原寫法在尾批次剩 1 檔時會把整包 MultiIndex 框當單檔 df，該檔基準會靜默遺失
+                    df_d = data_d[sym] if isinstance(data_d.columns, pd.MultiIndex) else data_d
                     df_d = df_d.dropna(subset=["Volume"])
                     if df_d.empty:
                         continue
@@ -175,8 +186,12 @@ def _fetch_single_mis_chunk(chunk, sym_map):
                 bid1 = float(b_list[0]) if b_list else 0.0
                 ask1 = float(a_list[0]) if a_list else 0.0
 
-                z_str = item.get("z", "-")
-                if z_str in ("-", "", None):
+                # traded=False 表示本拍無實際成交價 (MIS z="-")：舊程式以 bid1 冒充成交價，
+                # 會把「委買價上移」誤寫進成交價歷史，污染視窗低點/拉升幅度與外盤判定
+                z_raw = item.get("z", "-")
+                traded = z_raw not in ("-", "", None)
+                z_str = z_raw
+                if not traded:
                     z_str = str(bid1) if bid1 > 0 else item.get("y", "0")
 
                 try:
@@ -196,7 +211,8 @@ def _fetch_single_mis_chunk(chunk, sym_map):
                             "ask1": ask1,
                             "open": open_p,
                             "yest": yest_p,
-                            "low": low_p
+                            "low": low_p,
+                            "traded": traded
                         }
                 except Exception:
                     continue
@@ -232,13 +248,29 @@ def fetch_realtime_mis_quotes_parallel(symbols_list):
 
     return results
 
+def _alert_allowed(sym: str, now_ts: float) -> bool:
+    """跨策略去雜訊閘門：全域冷卻 + 單日上限。任一不通過即不推播 (不影響各策略自身冷卻)。"""
+    if GLOBAL_STOCK_ALERT_COOLDOWN_SEC > 0 and \
+            (now_ts - LAST_ALERT_ANY.get(sym, 0)) < GLOBAL_STOCK_ALERT_COOLDOWN_SEC:
+        return False
+    if MAX_ALERTS_PER_STOCK_PER_DAY > 0 and \
+            ALERT_COUNT_TODAY.get(sym, 0) >= MAX_ALERTS_PER_STOCK_PER_DAY:
+        return False
+    return True
+
+
+def _register_alert(sym: str, now_ts: float) -> None:
+    LAST_ALERT_ANY[sym] = now_ts
+    ALERT_COUNT_TODAY[sym] = ALERT_COUNT_TODAY.get(sym, 0) + 1
+
+
 def run_realtime_scan(send_hb_now=False, is_manual_test=False):
     start_t = time.time()
     tz_tw = pytz.timezone("Asia/Taipei")
     now_tw = datetime.now(tz_tw)
     now_ts = time.time()
 
-    if len(ACTIVE_UNIVERSE) < 100:
+    if len(ACTIVE_UNIVERSE) < 200:
         init_market_and_baseline()
 
     sorted_universe = sorted(list(ACTIVE_UNIVERSE), key=lambda s: clean_symbol_code(s) in FUTURES_SET, reverse=True)
@@ -253,6 +285,8 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
             yest_p = q["yest"]
             ask1 = q["ask1"]
             bid1 = q["bid1"]
+            if not q.get("traded", True):
+                continue  # 本拍無實際成交價 (z="-")：不寫入成交價歷史，避免 bid1 污染視窗與外盤判定
 
             if sym not in PRICE_VOL_HISTORY:
                 PRICE_VOL_HISTORY[sym] = deque(maxlen=35) # 保存約 5 分鐘 (30次x10秒) 的高頻軌跡
@@ -267,10 +301,12 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
                 delta_step_lots = max(0, cur_lots - prev_snap["lots"])
                 prev_ask1 = prev_snap["ask1"]
                 prev_price = prev_snap["price"]
+                step_dt = now_ts - prev_snap["ts"]
 
                 # 【外盤主動買進判定】：
                 # 只要本拍有新增成交量，且 (最新成交價 >= 上一拍委賣價ask1 或 最新成交價 == 本拍委賣價ask1 或 價格向上推升)
-                if delta_step_lots > 0:
+                # 但：與上一拍間隔過久時，量差是多拍累積量而非「10 秒掃貨」，不判外盤 (斷線/稀疏成交的聚合假訊號)
+                if delta_step_lots > 0 and step_dt <= OUTER_MAX_STEP_GAP_SEC:
                     if (prev_ask1 > 0 and cur_price >= prev_ask1) or (ask1 > 0 and cur_price >= ask1) or (cur_price > prev_price):
                         is_outer_buy = True
 
@@ -284,8 +320,10 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
                 "is_outer": is_outer_buy
             })
 
-            # 移除超過 300 秒 (5分鐘) 的過期紀錄
-            while len(hist) > 2 and (now_ts - hist[0]["ts"]) > 300:
+            # 移除超過 300 秒 (5分鐘) 的過期紀錄。
+            # 舊寫法保留至少 2 拍：斷線後恢復時最老一拍可能已是數分鐘前，
+            # 策略A的量差會把整段空白期的量算成「5分鐘爆量」，且視窗涵蓋守衛會被虛假通過
+            while hist and (now_ts - hist[0]["ts"]) > 300:
                 hist.popleft()
 
             if len(hist) < 2:
@@ -309,17 +347,22 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
             outer_sum_lots = sum(s["step_lots"] for s in outer_hits)
             outer_vol_ratio = outer_sum_lots / avg_5k_lots
 
-            # 條件 A：連續 >= 2 拍外盤主動大買單，合計 >= 150 張且達 5K 均量 1.6 倍
-            cond_streak_outer = (len(outer_hits) >= OUTER_STREAK_COUNT and outer_sum_lots >= OUTER_STREAK_MIN_LOTS and outer_vol_ratio >= OUTER_STREAK_VOL_RATIO)
+            # 條件 A：連續 >= 2 拍外盤主動大買單，合計 >= 150 張且達 5K 均量 1.6 倍，
+            # 且取樣點必須落在最近 OUTER_STREAK_WINDOW_SEC 秒內 (舊寫法跨數分鐘的零星外盤也算「連續」)
+            streak_window_ok = (now_ts - recent_snaps[0]["ts"]) <= OUTER_STREAK_WINDOW_SEC
+            cond_streak_outer = (streak_window_ok and len(outer_hits) >= OUTER_STREAK_COUNT and outer_sum_lots >= OUTER_STREAK_MIN_LOTS and outer_vol_ratio >= OUTER_STREAK_VOL_RATIO)
             # 條件 B：單拍 10 秒內外盤直接一擊狂敲 >= 250 張且達 5K 均量 2.0 倍
             cond_mega_outer = (is_outer_buy and delta_step_lots >= OUTER_SINGLE_MEGA_LOTS and (delta_step_lots / avg_5k_lots) >= 2.0)
 
             cooldown_key_outer = f"{sym}_OUTER"
             if (cond_streak_outer or cond_mega_outer) and (now_ts - ALERTED_COOLDOWN.get(cooldown_key_outer, 0)) >= 480:
-                # 確保近 30 秒價格是往上或平盤墊高，而非往下殺
+                # 確保近窗價格是往上或平盤墊高，而非往下殺。
+                # 修正舊 BUG：recent_low 含本拍，cur_price >= recent_low 恆真，守衛形同虛設；
+                # 改為現價不低於本視窗第一拍價格 (近窗淨變化 >= 0)
                 recent_low = min(s["price"] for s in recent_snaps)
-                if cur_price >= recent_low:
+                if cur_price >= recent_snaps[0]["price"] and _alert_allowed(sym, now_ts):
                     ALERTED_COOLDOWN[cooldown_key_outer] = now_ts
+                    _register_alert(sym, now_ts)
                     pull_pct = ((cur_price - recent_low) / recent_low) * 100 if recent_low > 0 else 0
                     action_desc = f"連 {len(outer_hits)} 拍外盤狂掃" if cond_streak_outer else "10秒外盤一擊巨單"
                     alerts.append({
@@ -343,6 +386,10 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
                 continue
 
             oldest_snap = hist[0]
+            # 視窗涵蓋守衛：視窗不足 MIN_5K_WINDOW_COVERAGE_SEC 秒時不判定，
+            # 否則開盤後 30~60 秒的量差會拿去跟「5 分鐘均量」比較，單位根本不對
+            if MIN_5K_WINDOW_COVERAGE_SEC > 0 and (now_ts - oldest_snap["ts"]) < MIN_5K_WINDOW_COVERAGE_SEC:
+                continue
             delta_5k_lots = cur_lots - oldest_snap["lots"]
             if delta_5k_lots < MIN_5K_LOTS:
                 continue
@@ -357,8 +404,9 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
                 continue
 
             instant_pct = ((cur_price - window_low) / window_low) * 100 if window_low > 0 else 0
-            if instant_pct >= PCT_THRESHOLD:
+            if instant_pct >= PCT_THRESHOLD and _alert_allowed(sym, now_ts):
                 ALERTED_COOLDOWN[cooldown_key_5k] = now_ts
+                _register_alert(sym, now_ts)
                 win_sec = max(10, int(now_ts - oldest_snap["ts"]))
 
                 if cur_price < open_p:
@@ -409,8 +457,12 @@ def main():
     is_weekday = now_tw.weekday() < 5
     current_hm = now_tw.hour * 100 + now_tw.minute
 
-    # 若在 13:35 收盤後才因排程延遲啟動，直接優雅結束，不亂發訊息
+    # 若在 13:35 收盤後才因排程延遲啟動，直接優雅結束，不亂發訊息。
+    # 修正：舊寫法對「收盤後才啟動的佇列殘留 run」仍執行單次掃描並發心跳，造成收盤後多餘 TG 訊息
     if not is_weekday or current_hm > 1335 or current_hm < 750:
+        if is_weekday and current_hm > 1335:
+            print("🔧 收盤後啟動 (排程佇列殘留)，不發測試訊息，直接結束")
+            return
         print(f"🔧 目前時間 {now_tw.strftime('%H:%M:%S')} 非盤中監控時段，執行單次連線測試...")
         init_market_and_baseline()
         run_realtime_scan(send_hb_now=True, is_manual_test=True)
