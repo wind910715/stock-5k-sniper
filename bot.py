@@ -32,7 +32,7 @@ OUTER_SINGLE_MEGA_LOTS = 250 # 單發外盤一擊必殺大單：10秒內外盤�
 MIN_AVG_DAILY_LOTS = 300     # 活躍股門檻：過去 5 日日均量 >= 300 張
 SCAN_INTERVAL_SEC = 10       # 每 10 秒極速巡邏一次全市場！(原為30秒，提速3倍)
 MAX_WORKERS = 10             # 10 執行緒併發抓取台灣證交所 MIS，將 61 秒壓縮至 3~5 秒！
-SEND_HEARTBEAT = True        # 每 5 分鐘整點發送心跳回報
+SEND_HEARTBEAT = False        # 盤中 5 分鐘心跳已關閉（2026-10-27 使用者要求：無訊號時不重複推播；手動測試仍發心跳）
 
 # 【去雜訊防護】2026-10-24 審查加入：皆為結構性防護 (非門檻調參)，可個別以數值關閉
 MIN_5K_WINDOW_COVERAGE_SEC = 240  # 策略A：取樣視窗須涵蓋 >= 240 秒才判定，避免拿 20~60 秒的量去除 5 分鐘均量基準 (設 0 關閉)
@@ -49,6 +49,7 @@ ALERTED_COOLDOWN = {}        # 記錄 (股票, 策略類型) 最後推播時間�
 PRICE_VOL_HISTORY = {}       # 儲存每檔股票近期快照：deque of dict
 LAST_ALERT_ANY = {}          # 每檔股票「任一策略」最後推播時間 (跨策略去重)
 ALERT_COUNT_TODAY = {}       # 每檔股票當日推播次數 (程序每日重啟，天然以日為界)
+LIMIT9_ALERTED = set()       # 9% 即將漲停／跌停警示：每檔每日每方向只發一次 (sym, "UP"/"DOWN")，獨立於 5K／外盤冷卻與單日上限
 
 FUTURES_SET = {
     "2330", "2317", "2454", "2382", "2308", "2303", "2881", "2882", "2891", "2603",
@@ -339,6 +340,31 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
             day_pct = ((cur_price - yest_p) / yest_p) * 100 if yest_p > 0 else 0
 
             # =========================================================================
+            # 🆕 即將漲停／跌停警示（2026-10-27 使用者新增）：當日漲跌幅達 ±9% 即發，
+            # 每檔每日每方向只發一次，獨立於 5K／外盤冷卻與單日上限
+            # =========================================================================
+            if day_pct >= 9.0 and (sym, "UP") not in LIMIT9_ALERTED:
+                LIMIT9_ALERTED.add((sym, "UP"))
+                alerts.append({
+                    "priority": 2 if clean_code in FUTURES_SET else 1,
+                    "vol_ratio": abs(day_pct),
+                    "msg": (
+                        f"{stock_name}（{clean_code}）即將漲停\n"
+                        f"時間：{now_tw.strftime('%H:%M:%S')}"
+                    )
+                })
+            elif day_pct <= -9.0 and (sym, "DOWN") not in LIMIT9_ALERTED:
+                LIMIT9_ALERTED.add((sym, "DOWN"))
+                alerts.append({
+                    "priority": 2 if clean_code in FUTURES_SET else 1,
+                    "vol_ratio": abs(day_pct),
+                    "msg": (
+                        f"{stock_name}（{clean_code}）即將跌停\n"
+                        f"時間：{now_tw.strftime('%H:%M:%S')}"
+                    )
+                })
+
+            # =========================================================================
             # 🎯 策略一：【外盤連續大買單（主力主動吃貨雷達）】— 抓起漲第一秒！
             # 檢查最近 3 個取樣點 (約 20~30 秒內) 是否連續出現外盤大單掃貨
             # =========================================================================
@@ -369,11 +395,8 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
                         "priority": 2 if clean_code in FUTURES_SET else 1,
                         "vol_ratio": outer_vol_ratio,
                         "msg": (
-                            f"🎯 *【外盤連續大買單】{clean_code} {stock_name}*{futures_tag}\n"
-                            f"🧨 訊號：`{action_desc}` (當日 `{day_pct:+.1f}%`)\n"
-                            f"⏰ 即時：`{now_tw.strftime('%H:%M:%S')}` | 💰 現價：`{cur_price:.2f}` (外盤價 `{ask1:.2f}`)\n"
-                            f"🛒 外盤掃貨：瞬間狂吃 **`{outer_sum_lots:,} 張`** (達5K均量 `{outer_vol_ratio:.1f}倍` / 5K均量`{int(avg_5k_lots):,}`張)\n"
-                            f"📈 瞬間墊高：`+{pull_pct:.2f}%` (起漲點火偵測！)"
+                            f"{stock_name}（{clean_code}）外盤連續買單\n"
+                            f"時間：{now_tw.strftime('%H:%M:%S')}"
                         )
                     })
                     continue
@@ -409,22 +432,12 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
                 _register_alert(sym, now_ts)
                 win_sec = max(10, int(now_ts - oldest_snap["ts"]))
 
-                if cur_price < open_p:
-                    pattern_tag = f"🔨開低探底急拉 (當日 {day_pct:+.1f}%)"
-                elif day_pct < 0:
-                    pattern_tag = f"🟢綠盤深V急拉 (當日 {day_pct:+.1f}%)"
-                else:
-                    pattern_tag = f"🔴盤中點火強拉 (當日 {day_pct:+.1f}%)"
-
                 alerts.append({
                     "priority": 2 if clean_code in FUTURES_SET else 1,
                     "vol_ratio": vol_ratio_5k,
                     "msg": (
-                        f"🔥 *【區間爆量急拉】{clean_code} {stock_name}*{futures_tag}\n"
-                        f"🏷️ 型態：`{pattern_tag}`\n"
-                        f"⏰ 即時：`{now_tw.strftime('%H:%M:%S')}` | 💰 現價：`{cur_price:.2f}`\n"
-                        f"🚀 瞬間急拉：`+{instant_pct:.2f}%` ({win_sec}秒內自 `{window_low:.2f}` 拉起)\n"
-                        f"💥 區間爆量：`{vol_ratio_5k:.1f} 倍` (狂敲 `{delta_5k_lots:,}`張 / 5K均量`{int(avg_5k_lots):,}`張)"
+                        f"{stock_name}（{clean_code}）5k爆量買單\n"
+                        f"時間：{now_tw.strftime('%H:%M:%S')}"
                     )
                 })
 
@@ -432,16 +445,10 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
     print(f"[{datetime.now(tz_tw).strftime('%H:%M:%S')}] ⚡ 10執行緒極速巡邏完成！僅耗時 {elapsed:.2f} 秒 (報價數: {len(live_quotes)})，抓到 {len(alerts)} 檔！")
 
     if alerts:
+        # 2026-10-27 使用者要求：每則訊號獨立推播、兩行格式，不再用群發標頭包 10 檔
         alerts.sort(key=lambda x: (x["priority"], x["vol_ratio"]), reverse=True)
-        for idx in range(0, len(alerts), 10):
-            chunk = alerts[idx:idx + 10]
-            header = (
-                f"⚡ *【0延遲外盤大單 & 5K急拉快訊】*\n"
-                f"🕒 時間：{now_tw.strftime('%H:%M:%S')} (極速掃描 **`{elapsed:.1f}秒`**)\n"
-                f"──────────────────\n\n"
-            )
-            body = "\n\n".join([item["msg"] for item in chunk])
-            send_telegram(header + body)
+        for item in alerts:
+            send_telegram(item["msg"])
     elif is_manual_test or send_hb_now:
         status_msg = (
             f"📡 *【0延遲雙引擎雷達心跳】*\n"
