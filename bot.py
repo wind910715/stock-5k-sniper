@@ -51,6 +51,13 @@ LAST_ALERT_ANY = {}          # 每檔股票「任一策略」最後推播時間 
 ALERT_COUNT_TODAY = {}       # 每檔股票當日推播次數 (程序每日重啟，天然以日為界)
 LIMIT9_ALERTED = set()       # 9% 即將漲停／跌停警示：每檔每日每方向只發一次 (sym, "UP"/"DOWN")，獨立於 5K／外盤冷卻與單日上限
 
+# 【截圖訊號擴充】2026-10-28 使用者定：截圖清單訊號直接寫入程式，明日偵測用（定義見 SCREEN_SIGNALS.md）
+MA_DICT = {}               # sym -> (ma5, ma10, ma20) 日線均線（暖機算好，算不出來該檔就跳過日線訊號）
+TREND_DICT = {}            # sym -> (slope, trend_today) 20 日高點最小平方法回歸趨勢線
+PREV_DAY_HIGH = {}         # sym -> 上一拍 MIS 當日最高價（判斷當日新高）
+PREV_DAY_LOW = {}          # sym -> 上一拍 MIS 當日最低價（判斷當日新低）
+DAY_SCREEN_ALERTED = set() # (sym, 策略名) 日線級訊號每日只發一次
+
 FUTURES_SET = {
     "2330", "2317", "2454", "2382", "2308", "2303", "2881", "2882", "2891", "2603",
     "2609", "2615", "3231", "2356", "2376", "2383", "3017", "3037", "3035", "3443",
@@ -136,7 +143,7 @@ def init_market_and_baseline():
     for i in range(0, len(all_symbols), 250):
         batch = all_symbols[i:i + 250]
         try:
-            data_d = yf.download(tickers=batch, period="7d", interval="1d", group_by="ticker", threads=True, progress=False)
+            data_d = yf.download(tickers=batch, period="1mo", interval="1d", group_by="ticker", threads=True, progress=False)
             if data_d.empty:
                 continue
             for sym in batch:
@@ -155,12 +162,34 @@ def init_market_and_baseline():
                         if avg_daily_vol >= min_daily_shares or clean_c in FUTURES_SET:
                             BASELINE_AVG_5K[sym] = max(5.0, (avg_daily_vol / 1000.0) / 54.0)
                             ACTIVE_UNIVERSE.add(sym)
+                            # 截圖訊號用日線資料：MA5/10/20 與 20 日高點回歸趨勢線
+                            # （算不出來就跳過該檔的日線訊號，不得讓暖機炸掉）
+                            try:
+                                df_clean = df_d[df_d.index.strftime('%Y-%m-%d') != now_str]
+                                df_clean = df_clean[df_clean["Volume"] > 0]
+                                if len(df_clean) >= 20:
+                                    closes20 = df_clean["Close"].tail(20)
+                                    MA_DICT[sym] = (float(closes20.tail(5).mean()),
+                                                    float(closes20.tail(10).mean()),
+                                                    float(closes20.mean()))
+                                    highs20 = [float(h) for h in df_clean["High"].tail(20).tolist()]
+                                    sx = sum(range(20))
+                                    sy = sum(highs20)
+                                    sxx = sum(x * x for x in range(20))
+                                    sxy = sum(x * h for x, h in zip(range(20), highs20))
+                                    denom = 20 * sxx - sx * sx
+                                    if denom != 0:
+                                        slope = (20 * sxy - sx * sy) / denom
+                                        intercept = (sy - slope * sx) / 20
+                                        TREND_DICT[sym] = (slope, slope * 20 + intercept)
+                            except Exception:
+                                pass
                 except Exception:
                     continue
         except Exception:
             pass
 
-    print(f"✅ [預熱完成] 鎖定 {len(ACTIVE_UNIVERSE)} 檔活躍股 (含 {len(FUTURES_SET)} 檔股期標的)！")
+    print(f"✅ [預熱完成] 鎖定 {len(ACTIVE_UNIVERSE)} 檔活躍股 (含 {len(FUTURES_SET)} 檔股期標的，MA20 資料 {len(MA_DICT)} 檔)！")
 
 def _fetch_single_mis_chunk(chunk, sym_map):
     """單一批次抓取證交所 MIS 報價 (供多執行緒併發呼叫，包含五檔委買委賣以判斷內外盤)"""
@@ -202,6 +231,7 @@ def _fetch_single_mis_chunk(chunk, sym_map):
                     open_p = float(item.get("o", price)) if item.get("o", "-") not in ("-", "") else price
                     yest_p = float(item.get("y", price)) if item.get("y", "-") not in ("-", "") else price
                     low_p = float(item.get("l", price)) if item.get("l", "-") not in ("-", "") else price
+                    high_p = float(item.get("h", price)) if item.get("h", "-") not in ("-", "") else price
 
                     if price > 0 and total_lots > 0:
                         chunk_results[sym] = {
@@ -213,6 +243,7 @@ def _fetch_single_mis_chunk(chunk, sym_map):
                             "open": open_p,
                             "yest": yest_p,
                             "low": low_p,
+                            "high": high_p,
                             "traded": traded
                         }
                 except Exception:
@@ -284,6 +315,8 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
             cur_lots = q["total_lots"]
             open_p = q["open"]
             yest_p = q["yest"]
+            high_p = q.get("high", cur_price)
+            low_p = q.get("low", cur_price)
             ask1 = q["ask1"]
             bid1 = q["bid1"]
             if not q.get("traded", True):
@@ -311,6 +344,18 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
                     if (prev_ask1 > 0 and cur_price >= prev_ask1) or (ask1 > 0 and cur_price >= ask1) or (cur_price > prev_price):
                         is_outer_buy = True
 
+            # 【截圖訊號】內盤主動賣單判定（外盤的鏡像）：成交價 <= 上一拍委買價、
+            # 或 <= 本拍委買價、或價格向下推；同樣排除間隔過久的累積量
+            is_inner_sell = False
+            if len(hist) >= 1:
+                prev_snap_i = hist[-1]
+                prev_bid1 = prev_snap_i["bid1"]
+                prev_price_i = prev_snap_i["price"]
+                step_dt_i = now_ts - prev_snap_i["ts"]
+                if delta_step_lots > 0 and step_dt_i <= OUTER_MAX_STEP_GAP_SEC:
+                    if (prev_bid1 > 0 and cur_price <= prev_bid1) or (bid1 > 0 and cur_price <= bid1) or (cur_price < prev_price_i):
+                        is_inner_sell = True
+
             hist.append({
                 "ts": now_ts,
                 "price": cur_price,
@@ -318,7 +363,8 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
                 "ask1": ask1,
                 "bid1": bid1,
                 "step_lots": delta_step_lots,
-                "is_outer": is_outer_buy
+                "is_outer": is_outer_buy,
+                "is_inner": is_inner_sell
             })
 
             # 移除超過 300 秒 (5分鐘) 的過期紀錄。
@@ -363,6 +409,118 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
                         f"時間：{now_tw.strftime('%H:%M:%S')}"
                     )
                 })
+
+            # =========================================================================
+            # 📋 截圖訊號擴充（2026-10-28 使用者定，明日偵測用）
+            # 定義見 SCREEN_SIGNALS.md；全部走同一套全域冷卻＋單日上限；
+            # 整段包 try/except，任一新訊號出錯不得拖垮整輪掃描。
+            # 位置刻意放在外盤／5K 區塊之前：那兩段結尾有 continue，放在後面會被跳過
+            # =========================================================================
+            try:
+                def _screen_push(tag, label, cooldown_sec, once_per_day=False):
+                    key = f"{sym}_{tag}"
+                    if once_per_day:
+                        if key in DAY_SCREEN_ALERTED:
+                            return
+                    elif (now_ts - ALERTED_COOLDOWN.get(key, 0)) < cooldown_sec:
+                        return
+                    if not _alert_allowed(sym, now_ts):
+                        return
+                    if once_per_day:
+                        DAY_SCREEN_ALERTED.add(key)
+                    else:
+                        ALERTED_COOLDOWN[key] = now_ts
+                    _register_alert(sym, now_ts)
+                    alerts.append({
+                        "priority": 2 if clean_code in FUTURES_SET else 1,
+                        "vol_ratio": 0,
+                        "msg": (
+                            f"{stock_name}（{clean_code}）{label}\n"
+                            f"時間：{now_tw.strftime('%H:%M:%S')}"
+                        )
+                    })
+
+                # ---- 日線級（每日每檔每策略只發一次）----
+                ma = MA_DICT.get(sym)
+                if ma is not None and yest_p > 0:
+                    ma5, ma10, ma20 = ma
+                    if yest_p <= ma20 < cur_price:
+                        _screen_push("MA20BRK", "股價突破20日均線", 0, once_per_day=True)
+                    ma_max = max(ma5, ma10, ma20)
+                    ma_min = min(ma5, ma10, ma20)
+                    if ma_min > 0 and (ma_max / ma_min - 1) <= 0.02 and yest_p <= ma_max < cur_price:
+                        _screen_push("MABIND", "突破均線糾纏區", 0, once_per_day=True)
+                    if len(hist) >= 2 and ma5 < ma10 < ma20 and cur_price < ma5 and cur_price < hist[-2]["price"]:
+                        _screen_push("MABEAR", "均線空頭排列下降", 0, once_per_day=True)
+                tr = TREND_DICT.get(sym)
+                if tr is not None and yest_p > 0:
+                    slope, trend_today = tr
+                    if slope < 0 and yest_p <= trend_today < cur_price:
+                        _screen_push("DOWNTRENDBRK", "突破下降趨勢線", 0, once_per_day=True)
+
+                # ---- 當日新高／新低（MIS 當日高低價變動，600 秒冷卻）----
+                prev_h = PREV_DAY_HIGH.get(sym)
+                if prev_h is not None and high_p > prev_h and cur_price >= high_p and high_p > yest_p:
+                    _screen_push("DAYHIGH", "股價當日新高股", 600)
+                PREV_DAY_HIGH[sym] = high_p
+                prev_l = PREV_DAY_LOW.get(sym)
+                if prev_l is not None and low_p < prev_l and cur_price <= low_p and low_p < yest_p:
+                    _screen_push("DAYLOW", "股價當日新低股", 600)
+                PREV_DAY_LOW[sym] = low_p
+
+                # ---- 盤中 1 分 K 級 ----
+                # 內盤連續賣單：外盤連續買單的鏡像（最近 3 拍、每拍 >= 20 張、合計 >= 150 張且達 5K 均量 1.6 倍、60 秒內、480 秒冷卻）
+                recent3 = list(hist)[-3:]
+                inner_hits = [s for s in recent3 if s.get("is_inner") and s["step_lots"] >= 20]
+                inner_sum = sum(s["step_lots"] for s in inner_hits)
+                if (len(recent3) >= 2 and (now_ts - recent3[0]["ts"]) <= OUTER_STREAK_WINDOW_SEC
+                        and len(inner_hits) >= OUTER_STREAK_COUNT and inner_sum >= OUTER_STREAK_MIN_LOTS
+                        and (inner_sum / avg_5k_lots) >= OUTER_STREAK_VOL_RATIO):
+                    _screen_push("INNERSTREAK", "內盤連續賣單", 480)
+                # 連續二分鐘內盤大量成交：最近 120 秒內盤累計 >= 300 張
+                inner_2m = sum(s["step_lots"] for s in hist if s.get("is_inner") and (now_ts - s["ts"]) <= 120)
+                if inner_2m >= 300:
+                    _screen_push("INNER2M", "連續二分鐘內盤大量成交", 600)
+                # 連續三分鐘大量成交：最近 3 個 60 秒桶每桶 >= 100 張
+                buckets = [0, 0, 0]
+                for s in hist:
+                    age = now_ts - s["ts"]
+                    if age <= 60:
+                        buckets[2] += s["step_lots"]
+                    elif age <= 120:
+                        buckets[1] += s["step_lots"]
+                    elif age <= 180:
+                        buckets[0] += s["step_lots"]
+                if all(b >= 100 for b in buckets):
+                    _screen_push("VOL3M", "連續三分鐘大量成交", 600)
+                # 瞬間巨量大於 300 張：單拍 10 秒內成交量差 >= 300 張（不分內外盤）
+                if delta_step_lots >= 300:
+                    _screen_push("MEGA300", "瞬間巨量大於300張", 600)
+                # 主力吃貨：5 分鐘內外盤累計 >= 300 張且達 5K 均量 1.6 倍，但當日漲幅 < 2%（還沒拉起來、默默吃）
+                outer_5m = sum(s["step_lots"] for s in hist if s.get("is_outer"))
+                if outer_5m >= 300 and (outer_5m / avg_5k_lots) >= 1.6 and day_pct < 2.0:
+                    _screen_push("EAT", "主力吃貨", 600)
+                # 一分鐘內跌 2% 以上：現價較 60 秒前那拍跌 >= 2%
+                snap_60 = None
+                for s in hist:
+                    if (now_ts - s["ts"]) >= 60:
+                        snap_60 = s
+                if snap_60 is not None and snap_60["price"] > 0 and cur_price <= snap_60["price"] * 0.98:
+                    _screen_push("DROP1M", "一分鐘內跌2%以上", 600)
+                # 一分鐘量縮 2% 以上：最近 60 秒量較前一個 60 秒量縮 >= 2%（前 60 秒量 >= 100 張才算，避免小量雜訊）
+                vol_now_60 = sum(s["step_lots"] for s in hist if (now_ts - s["ts"]) <= 60)
+                vol_prev_60 = sum(s["step_lots"] for s in hist if 60 < (now_ts - s["ts"]) <= 120)
+                if vol_prev_60 >= 100 and vol_now_60 <= vol_prev_60 * 0.98:
+                    _screen_push("SHRINK1M", "一分鐘量縮2%以上", 600)
+                # 急拉平盤整理：5 分鐘視窗高低差 <= 1%（平盤整理）且現價自視窗低點急拉 >= 1.5%（純價型，不含成交量條件）
+                win_prices = [s["price"] for s in hist]
+                if win_prices:
+                    w_low = min(win_prices)
+                    w_high = max(win_prices)
+                    if w_low > 0 and ((w_high - w_low) / w_low) <= 0.01 and cur_price >= w_low * 1.015:
+                        _screen_push("FLATSURGE", "急拉平盤整理", 600)
+            except Exception:
+                pass
 
             # =========================================================================
             # 🎯 策略一：【外盤連續大買單（主力主動吃貨雷達）】— 抓起漲第一秒！
@@ -484,7 +642,8 @@ def main():
         f"⚡ **三大升級**：\n"
         f"1️⃣ 10執行緒併發，全市場掃描從 61秒 壓縮至 **3~5秒**！\n"
         f"2️⃣ 巡邏密度提升至 **每 10 秒一次**！\n"
-        f"3️⃣ 新增 **【🎯外盤連續大買單】** 策略，主力一吃外盤立刻抓起漲！"
+        f"3️⃣ 新增 **【🎯外盤連續大買單】** 策略，主力一吃外盤立刻抓起漲！\n"
+        f"4️⃣ 新增 **【📋截圖訊號 14 項】**：均線突破／趨勢線／內盤賣單／當日新高低等同步偵測！"
     )
 
     last_hb_slot = None
