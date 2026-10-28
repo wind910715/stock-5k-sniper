@@ -38,8 +38,8 @@ SEND_HEARTBEAT = False        # 盤中 5 分鐘心跳已關閉（2026-10-27 使�
 MIN_5K_WINDOW_COVERAGE_SEC = 240  # 策略A：取樣視窗須涵蓋 >= 240 秒才判定，避免拿 20~60 秒的量去除 5 分鐘均量基準 (設 0 關閉)
 OUTER_MAX_STEP_GAP_SEC = 30       # 策略B：與上一拍間隔 > 30 秒的量差視為「累積量」(斷線/稀疏成交)，不算 10 秒掃貨 (設極大值可關閉)
 OUTER_STREAK_WINDOW_SEC = 60      # 策略B：「連續」外盤的取樣點必須落在最近 60 秒內，跨數分鐘的零星外盤不算連續
-GLOBAL_STOCK_ALERT_COOLDOWN_SEC = 300  # 同一檔股票任一策略推播後，300 秒內不推另一策略 (同一波行情不重複轟炸，設 0 關閉)
-MAX_ALERTS_PER_STOCK_PER_DAY = 5  # 同一檔股票單日推播上限 (兩策略合計，設 0 不限制)
+GLOBAL_STOCK_ALERT_COOLDOWN_SEC = 0  # 跨策略冷卻已關閉（2026-10-28 使用者定：不同訊號觸及都發；設 0 關閉）
+MAX_ALERTS_PER_STOCK_PER_DAY = 0  # 單日上限已取消（2026-10-28 使用者定：大波動行情不錯過；設 0 不限制）
 # ==========================================================
 
 STOCK_DICT = {}
@@ -281,7 +281,7 @@ def fetch_realtime_mis_quotes_parallel(symbols_list):
     return results
 
 def _alert_allowed(sym: str, now_ts: float) -> bool:
-    """跨策略去雜訊閘門：全域冷卻 + 單日上限。任一不通過即不推播 (不影響各策略自身冷卻)。"""
+    """跨策略去雜訊閘門（2026-10-28 使用者定已關閉：不同訊號都發、單日無上限；常數為 0 時此函式恆 True，僅保留結構供日後重開）。"""
     if GLOBAL_STOCK_ALERT_COOLDOWN_SEC > 0 and \
             (now_ts - LAST_ALERT_ANY.get(sym, 0)) < GLOBAL_STOCK_ALERT_COOLDOWN_SEC:
         return False
@@ -412,7 +412,8 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
 
             # =========================================================================
             # 📋 截圖訊號擴充（2026-10-28 使用者定，明日偵測用）
-            # 定義見 SCREEN_SIGNALS.md；全部走同一套全域冷卻＋單日上限；
+            # 定義見 SCREEN_SIGNALS.md；跨策略冷卻與單日上限已關閉（2026-10-28 使用者定：不同訊號都發、大波動不設上限）；
+            # 重複訊號冷卻統一 180 秒；日線級事件維持每日每檔一次。
             # 整段包 try/except，任一新訊號出錯不得拖垮整輪掃描。
             # 位置刻意放在外盤／5K 區塊之前：那兩段結尾有 continue，放在後面會被跳過
             # =========================================================================
@@ -458,29 +459,29 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
                     if slope < 0 and yest_p <= trend_today < cur_price:
                         _screen_push("DOWNTRENDBRK", "突破下降趨勢線", 0, once_per_day=True)
 
-                # ---- 當日新高／新低（MIS 當日高低價變動，600 秒冷卻）----
+                # ---- 當日新高／新低（MIS 當日高低價變動，180 秒冷卻）----
                 prev_h = PREV_DAY_HIGH.get(sym)
                 if prev_h is not None and high_p > prev_h and cur_price >= high_p and high_p > yest_p:
-                    _screen_push("DAYHIGH", "股價當日新高股", 600)
+                    _screen_push("DAYHIGH", "股價當日新高股", 180)
                 PREV_DAY_HIGH[sym] = high_p
                 prev_l = PREV_DAY_LOW.get(sym)
                 if prev_l is not None and low_p < prev_l and cur_price <= low_p and low_p < yest_p:
-                    _screen_push("DAYLOW", "股價當日新低股", 600)
+                    _screen_push("DAYLOW", "股價當日新低股", 180)
                 PREV_DAY_LOW[sym] = low_p
 
                 # ---- 盤中 1 分 K 級 ----
-                # 內盤連續賣單：外盤連續買單的鏡像（最近 3 拍、每拍 >= 20 張、合計 >= 150 張且達 5K 均量 1.6 倍、60 秒內、480 秒冷卻）
+                # 內盤連續賣單：外盤連續買單的鏡像（最近 3 拍、每拍 >= 20 張、合計 >= 150 張且達 5K 均量 1.6 倍、60 秒內、180 秒冷卻）
                 recent3 = list(hist)[-3:]
                 inner_hits = [s for s in recent3 if s.get("is_inner") and s["step_lots"] >= 20]
                 inner_sum = sum(s["step_lots"] for s in inner_hits)
                 if (len(recent3) >= 2 and (now_ts - recent3[0]["ts"]) <= OUTER_STREAK_WINDOW_SEC
                         and len(inner_hits) >= OUTER_STREAK_COUNT and inner_sum >= OUTER_STREAK_MIN_LOTS
                         and (inner_sum / avg_5k_lots) >= OUTER_STREAK_VOL_RATIO):
-                    _screen_push("INNERSTREAK", "內盤連續賣單", 480)
+                    _screen_push("INNERSTREAK", "內盤連續賣單", 180)
                 # 連續二分鐘內盤大量成交：最近 120 秒內盤累計 >= 300 張
                 inner_2m = sum(s["step_lots"] for s in hist if s.get("is_inner") and (now_ts - s["ts"]) <= 120)
                 if inner_2m >= 300:
-                    _screen_push("INNER2M", "連續二分鐘內盤大量成交", 600)
+                    _screen_push("INNER2M", "連續二分鐘內盤大量成交", 180)
                 # 連續三分鐘大量成交：最近 3 個 60 秒桶每桶 >= 100 張
                 buckets = [0, 0, 0]
                 for s in hist:
@@ -492,33 +493,33 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
                     elif age <= 180:
                         buckets[0] += s["step_lots"]
                 if all(b >= 100 for b in buckets):
-                    _screen_push("VOL3M", "連續三分鐘大量成交", 600)
+                    _screen_push("VOL3M", "連續三分鐘大量成交", 180)
                 # 瞬間巨量大於 300 張：單拍 10 秒內成交量差 >= 300 張（不分內外盤）
                 if delta_step_lots >= 300:
-                    _screen_push("MEGA300", "瞬間巨量大於300張", 600)
+                    _screen_push("MEGA300", "瞬間巨量大於300張", 180)
                 # 主力吃貨：5 分鐘內外盤累計 >= 300 張且達 5K 均量 1.6 倍，但當日漲幅 < 2%（還沒拉起來、默默吃）
                 outer_5m = sum(s["step_lots"] for s in hist if s.get("is_outer"))
                 if outer_5m >= 300 and (outer_5m / avg_5k_lots) >= 1.6 and day_pct < 2.0:
-                    _screen_push("EAT", "主力吃貨", 600)
+                    _screen_push("EAT", "主力吃貨", 180)
                 # 一分鐘內跌 2% 以上：現價較 60 秒前那拍跌 >= 2%
                 snap_60 = None
                 for s in hist:
                     if (now_ts - s["ts"]) >= 60:
                         snap_60 = s
                 if snap_60 is not None and snap_60["price"] > 0 and cur_price <= snap_60["price"] * 0.98:
-                    _screen_push("DROP1M", "一分鐘內跌2%以上", 600)
+                    _screen_push("DROP1M", "一分鐘內跌2%以上", 180)
                 # 一分鐘量縮 2% 以上：最近 60 秒量較前一個 60 秒量縮 >= 2%（前 60 秒量 >= 100 張才算，避免小量雜訊）
                 vol_now_60 = sum(s["step_lots"] for s in hist if (now_ts - s["ts"]) <= 60)
                 vol_prev_60 = sum(s["step_lots"] for s in hist if 60 < (now_ts - s["ts"]) <= 120)
                 if vol_prev_60 >= 100 and vol_now_60 <= vol_prev_60 * 0.98:
-                    _screen_push("SHRINK1M", "一分鐘量縮2%以上", 600)
+                    _screen_push("SHRINK1M", "一分鐘量縮2%以上", 180)
                 # 急拉平盤整理：5 分鐘視窗高低差 <= 1%（平盤整理）且現價自視窗低點急拉 >= 1.5%（純價型，不含成交量條件）
                 win_prices = [s["price"] for s in hist]
                 if win_prices:
                     w_low = min(win_prices)
                     w_high = max(win_prices)
                     if w_low > 0 and ((w_high - w_low) / w_low) <= 0.01 and cur_price >= w_low * 1.015:
-                        _screen_push("FLATSURGE", "急拉平盤整理", 600)
+                        _screen_push("FLATSURGE", "急拉平盤整理", 180)
             except Exception:
                 pass
 
@@ -539,7 +540,7 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
             cond_mega_outer = (is_outer_buy and delta_step_lots >= OUTER_SINGLE_MEGA_LOTS and (delta_step_lots / avg_5k_lots) >= 2.0)
 
             cooldown_key_outer = f"{sym}_OUTER"
-            if (cond_streak_outer or cond_mega_outer) and (now_ts - ALERTED_COOLDOWN.get(cooldown_key_outer, 0)) >= 480:
+            if (cond_streak_outer or cond_mega_outer) and (now_ts - ALERTED_COOLDOWN.get(cooldown_key_outer, 0)) >= 180:
                 # 確保近窗價格是往上或平盤墊高，而非往下殺。
                 # 修正舊 BUG：recent_low 含本拍，cur_price >= recent_low 恆真，守衛形同虛設；
                 # 改為現價不低於本視窗第一拍價格 (近窗淨變化 >= 0)
@@ -563,7 +564,7 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
             # 🔥 策略二：【滾動 5K 區間爆量急拉】
             # =========================================================================
             cooldown_key_5k = f"{sym}_5K"
-            if (now_ts - ALERTED_COOLDOWN.get(cooldown_key_5k, 0)) < 600:
+            if (now_ts - ALERTED_COOLDOWN.get(cooldown_key_5k, 0)) < 180:
                 continue
 
             oldest_snap = hist[0]
