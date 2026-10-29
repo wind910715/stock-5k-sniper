@@ -508,11 +508,6 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
                         snap_60 = s
                 if snap_60 is not None and snap_60["price"] > 0 and cur_price <= snap_60["price"] * 0.98:
                     _screen_push("DROP1M", "一分鐘內跌2%以上", 180)
-                # 一分鐘量縮 2% 以上：最近 60 秒量較前一個 60 秒量縮 >= 2%（前 60 秒量 >= 100 張才算，避免小量雜訊）
-                vol_now_60 = sum(s["step_lots"] for s in hist if (now_ts - s["ts"]) <= 60)
-                vol_prev_60 = sum(s["step_lots"] for s in hist if 60 < (now_ts - s["ts"]) <= 120)
-                if vol_prev_60 >= 100 and vol_now_60 <= vol_prev_60 * 0.98:
-                    _screen_push("SHRINK1M", "一分鐘量縮2%以上", 180)
                 # 急拉平盤整理：5 分鐘視窗高低差 <= 1%（平盤整理）且現價自視窗低點急拉 >= 1.5%（純價型，不含成交量條件）
                 win_prices = [s["price"] for s in hist]
                 if win_prices:
@@ -644,7 +639,7 @@ def main():
         f"1️⃣ 10執行緒併發，全市場掃描從 61秒 壓縮至 **3~5秒**！\n"
         f"2️⃣ 巡邏密度提升至 **每 10 秒一次**！\n"
         f"3️⃣ 新增 **【🎯外盤連續大買單】** 策略，主力一吃外盤立刻抓起漲！\n"
-        f"4️⃣ 新增 **【📋截圖訊號 14 項】**：均線突破／趨勢線／內盤賣單／當日新高低等同步偵測！"
+        f"4️⃣ 新增 **【📋截圖訊號 13 項】**：均線突破／趨勢線／內盤賣單／當日新高低等同步偵測！"
     )
 
     last_hb_slot = None
