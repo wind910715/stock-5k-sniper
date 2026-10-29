@@ -532,11 +532,6 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
                 # 一分鐘內漲 2% 以上（一分鐘內跌 2% 的鏡像，使用者 2026-10-29 定：漲跌皆指價格）：現價較 60 秒前那拍漲 >= 2%
                 if snap_60 is not None and snap_60["price"] > 0 and cur_price >= snap_60["price"] * 1.02:
                     _screen_push("RISE1M", "一分鐘內漲2%以上", 180)
-                # 一分鐘量漲 2% 以上（截圖原文）：最近 60 秒量較前一個 60 秒漲 >= 2%（前 60 秒量 >= 100 張才算）
-                vol_now_60 = sum(s["step_lots"] for s in hist if (now_ts - s["ts"]) <= 60)
-                vol_prev_60 = sum(s["step_lots"] for s in hist if 60 < (now_ts - s["ts"]) <= 120)
-                if vol_prev_60 >= 100 and vol_now_60 >= vol_prev_60 * 1.02:
-                    _screen_push("VOLRISE", "一分鐘量漲2%以上", 180)
                 # 急拉平盤整理（截圖字面定義，XQ 附錄無此項）：5 分鐘視窗高低差 <= 1% 且現價自視窗低點急拉 >= 1.5%
                 win_prices = [s["price"] for s in hist]
                 if win_prices:
@@ -675,7 +670,7 @@ def main():
         f"1️⃣ 10執行緒併發，全市場掃描從 61秒 壓縮至 **3~5秒**！\n"
         f"2️⃣ 巡邏密度提升至 **每 10 秒一次**！\n"
         f"3️⃣ 新增 **【🎯外盤連續大買單】** 策略，主力一吃外盤立刻抓起漲！\n"
-        f"4️⃣ 新增 **【📋截圖訊號 16 項】**：均線突破／趨勢線／主力出貨／當日新高低等同步偵測！"
+        f"4️⃣ 新增 **【📋截圖訊號 15 項】**：均線突破／趨勢線／主力出貨／當日新高低等同步偵測！"
     )
 
     last_hb_slot = None
