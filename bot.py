@@ -44,6 +44,9 @@ MAX_ALERTS_PER_STOCK_PER_DAY = 0  # 單日上限已取消（2026-10-28 使用者
 
 STOCK_DICT = {}
 BASELINE_AVG_5K = {}         # 過去 5 日每 5 分鐘平均張數
+AVG_DAILY_LOTS = {}          # 過去 5 日平均日成交張數（XQ 糾集區／創當日新高／暴量股的均量濾網用）
+DAY_OUTER_LOTS = {}          # 當日累計外盤張數（程式啟動後累計，主力吃貨／出貨比值用）
+DAY_INNER_LOTS = {}          # 當日累計內盤張數（同上）
 ACTIVE_UNIVERSE = set()
 ALERTED_COOLDOWN = {}        # 記錄 (股票, 策略類型) 最後推播時間，防止重複刷屏
 PRICE_VOL_HISTORY = {}       # 儲存每檔股票近期快照：deque of dict
@@ -52,7 +55,7 @@ ALERT_COUNT_TODAY = {}       # 每檔股票當日推播次數 (程序每日重�
 LIMIT9_ALERTED = set()       # 9% 即將漲停／跌停警示：每檔每日每方向只發一次 (sym, "UP"/"DOWN")，獨立於 5K／外盤冷卻與單日上限
 
 # 【截圖訊號擴充】2026-10-28 使用者定：截圖清單訊號直接寫入程式，明日偵測用（定義見 SCREEN_SIGNALS.md）
-MA_DICT = {}               # sym -> (ma5, ma10, ma20) 日線均線（暖機算好，算不出來該檔就跳過日線訊號）
+MA_DICT = {}               # sym -> (ma5, ma10, ma20, ma60, ma120) 日線均線（暖機算好，ma60/ma120 算不出來為 None，該檔跳過糾集區訊號）
 TREND_DICT = {}            # sym -> (slope, trend_today) 20 日高點最小平方法回歸趨勢線
 PREV_DAY_HIGH = {}         # sym -> 上一拍 MIS 當日最高價（判斷當日新高）
 PREV_DAY_LOW = {}          # sym -> 上一拍 MIS 當日最低價（判斷當日新低）
@@ -98,7 +101,7 @@ def is_valid_stock_code(code):
     return True
 
 def init_market_and_baseline():
-    global STOCK_DICT, FUTURES_SET, BASELINE_AVG_5K, ACTIVE_UNIVERSE
+    global STOCK_DICT, FUTURES_SET, BASELINE_AVG_5K, ACTIVE_UNIVERSE, AVG_DAILY_LOTS
     if len(ACTIVE_UNIVERSE) > 200:
         return
 
@@ -143,7 +146,7 @@ def init_market_and_baseline():
     for i in range(0, len(all_symbols), 250):
         batch = all_symbols[i:i + 250]
         try:
-            data_d = yf.download(tickers=batch, period="1mo", interval="1d", group_by="ticker", threads=True, progress=False)
+            data_d = yf.download(tickers=batch, period="1y", interval="1d", group_by="ticker", threads=True, progress=False)
             if data_d.empty:
                 continue
             for sym in batch:
@@ -161,17 +164,21 @@ def init_market_and_baseline():
                         clean_c = clean_symbol_code(sym)
                         if avg_daily_vol >= min_daily_shares or clean_c in FUTURES_SET:
                             BASELINE_AVG_5K[sym] = max(5.0, (avg_daily_vol / 1000.0) / 54.0)
+                            AVG_DAILY_LOTS[sym] = avg_daily_vol / 1000.0
                             ACTIVE_UNIVERSE.add(sym)
-                            # 截圖訊號用日線資料：MA5/10/20 與 20 日高點回歸趨勢線
-                            # （算不出來就跳過該檔的日線訊號，不得讓暖機炸掉）
+                            # 截圖訊號用日線資料：MA5/10/20/60/120 與 20 日高點回歸趨勢線
+                            # （XQ 糾集區需 MA60/120，故日線改抓 1 年；算不出來就跳過該檔的日線訊號，不得讓暖機炸掉）
                             try:
                                 df_clean = df_d[df_d.index.strftime('%Y-%m-%d') != now_str]
                                 df_clean = df_clean[df_clean["Volume"] > 0]
                                 if len(df_clean) >= 20:
-                                    closes20 = df_clean["Close"].tail(20)
-                                    MA_DICT[sym] = (float(closes20.tail(5).mean()),
-                                                    float(closes20.tail(10).mean()),
-                                                    float(closes20.mean()))
+                                    closes = df_clean["Close"]
+                                    ma60 = float(closes.tail(60).mean()) if len(df_clean) >= 60 else None
+                                    ma120 = float(closes.tail(120).mean()) if len(df_clean) >= 120 else None
+                                    MA_DICT[sym] = (float(closes.tail(5).mean()),
+                                                    float(closes.tail(10).mean()),
+                                                    float(closes.tail(20).mean()),
+                                                    ma60, ma120)
                                     highs20 = [float(h) for h in df_clean["High"].tail(20).tolist()]
                                     sx = sum(range(20))
                                     sy = sum(highs20)
@@ -367,6 +374,12 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
                 "is_inner": is_inner_sell
             })
 
+            # 主力吃貨／出貨（XQ）用當日累計內外盤量：程式開盤前啟動，故自啟動起累計約等於當日累計；中途重啟則只含重啟後部分
+            if is_outer_buy:
+                DAY_OUTER_LOTS[sym] = DAY_OUTER_LOTS.get(sym, 0) + delta_step_lots
+            if is_inner_sell:
+                DAY_INNER_LOTS[sym] = DAY_INNER_LOTS.get(sym, 0) + delta_step_lots
+
             # 移除超過 300 秒 (5分鐘) 的過期紀錄。
             # 舊寫法保留至少 2 拍：斷線後恢復時最老一拍可能已是數分鐘前，
             # 策略A的量差會把整段空白期的量算成「5分鐘爆量」，且視窗涵蓋守衛會被虛假通過
@@ -411,7 +424,7 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
                 })
 
             # =========================================================================
-            # 📋 截圖訊號擴充（2026-10-28 使用者定，明日偵測用）
+            # 📋 截圖訊號擴充（2026-10-28 使用者定，明日偵測用；2026-10-29 起定義以 XQ 即時選股附錄為準，僅限截圖 17 組）
             # 定義見 SCREEN_SIGNALS.md；跨策略冷卻與單日上限已關閉（2026-10-28 使用者定：不同訊號都發、大波動不設上限）；
             # 重複訊號冷卻統一 180 秒；日線級事件維持每日每檔一次。
             # 整段包 try/except，任一新訊號出錯不得拖垮整輪掃描。
@@ -441,16 +454,24 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
                         )
                     })
 
-                # ---- 日線級（每日每檔每策略只發一次）----
+                # ---- 日線級（每日每檔每策略只發一次；定義原則見 SCREEN_SIGNALS.md，XQ 有定義者從 XQ）----
                 ma = MA_DICT.get(sym)
                 if ma is not None and yest_p > 0:
-                    ma5, ma10, ma20 = ma
+                    ma5, ma10, ma20, ma60, ma120 = ma
                     if yest_p <= ma20 < cur_price:
                         _screen_push("MA20BRK", "股價突破20日均線", 0, once_per_day=True)
-                    ma_max = max(ma5, ma10, ma20)
-                    ma_min = min(ma5, ma10, ma20)
-                    if ma_min > 0 and (ma_max / ma_min - 1) <= 0.02 and yest_p <= ma_max < cur_price:
-                        _screen_push("MABIND", "突破均線糾纏區", 0, once_per_day=True)
+                    if yest_p >= ma20 > cur_price:
+                        _screen_push("MA20DOWN", "股價跌破20日均線", 0, once_per_day=True)
+                    # 突破均線糾集區（XQ）：五日均量>5000張＋5/20/60/120日MA彼此差距2%內＋MA5>MA20＋站上所有均線＋開盤跳空1%但低於3%
+                    avg_day = AVG_DAILY_LOTS.get(sym, 0)
+                    if (avg_day > 5000 and ma60 is not None and ma120 is not None):
+                        ma_all = [ma5, ma20, ma60, ma120]
+                        ma_max = max(ma_all)
+                        ma_min = min(ma_all)
+                        gap_up = (open_p - yest_p) / yest_p if yest_p > 0 else 0
+                        if (ma_min > 0 and (ma_max / ma_min - 1) <= 0.02 and ma5 > ma20
+                                and all(cur_price > m for m in ma_all) and 0.01 <= gap_up < 0.03):
+                            _screen_push("MABIND", "突破均線糾纏區", 0, once_per_day=True)
                     if len(hist) >= 2 and ma5 < ma10 < ma20 and cur_price < ma5 and cur_price < hist[-2]["price"]:
                         _screen_push("MABEAR", "均線空頭排列下降", 0, once_per_day=True)
                 tr = TREND_DICT.get(sym)
@@ -459,9 +480,25 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
                     if slope < 0 and yest_p <= trend_today < cur_price:
                         _screen_push("DOWNTRENDBRK", "突破下降趨勢線", 0, once_per_day=True)
 
-                # ---- 當日新高／新低（MIS 當日高低價變動，180 秒冷卻）----
+                # ---- 當日新高／新低（180 秒冷卻）----
+                # 股價當日新高（XQ 股價創當日新高）：五日均量>2000張＋股價上漲＋突破今日高點＋連續5分鐘每分鐘量>五日平均分鐘量
+                # （XQ 另有「優於大盤」條件，因程式無大盤即時資料未實作；五日平均分鐘量＝五日均量／270分鐘）
                 prev_h = PREV_DAY_HIGH.get(sym)
-                if prev_h is not None and high_p > prev_h and cur_price >= high_p and high_p > yest_p:
+                avg_day = AVG_DAILY_LOTS.get(sym, 0)
+                day_high_ok = False
+                if (avg_day > 2000 and day_pct > 0 and prev_h is not None
+                        and high_p > prev_h and cur_price >= high_p and high_p > yest_p):
+                    buckets5 = [0, 0, 0, 0, 0]
+                    bucket_has = [False, False, False, False, False]
+                    for s in hist:
+                        age = now_ts - s["ts"]
+                        if age < 300:
+                            b = min(4, int(age // 60))
+                            buckets5[b] += s["step_lots"]
+                            bucket_has[b] = True
+                    if all(bucket_has) and all(v > avg_day / 270.0 for v in buckets5):
+                        day_high_ok = True
+                if day_high_ok:
                     _screen_push("DAYHIGH", "股價當日新高股", 180)
                 PREV_DAY_HIGH[sym] = high_p
                 prev_l = PREV_DAY_LOW.get(sym)
@@ -469,52 +506,48 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
                     _screen_push("DAYLOW", "股價當日新低股", 180)
                 PREV_DAY_LOW[sym] = low_p
 
-                # ---- 盤中 1 分 K 級 ----
-                # 內盤連續賣單：外盤連續買單的鏡像（最近 3 拍、每拍 >= 20 張、合計 >= 150 張且達 5K 均量 1.6 倍、60 秒內、180 秒冷卻）
-                recent3 = list(hist)[-3:]
-                inner_hits = [s for s in recent3 if s.get("is_inner") and s["step_lots"] >= 20]
-                inner_sum = sum(s["step_lots"] for s in inner_hits)
-                if (len(recent3) >= 2 and (now_ts - recent3[0]["ts"]) <= OUTER_STREAK_WINDOW_SEC
-                        and len(inner_hits) >= OUTER_STREAK_COUNT and inner_sum >= OUTER_STREAK_MIN_LOTS
-                        and (inner_sum / avg_5k_lots) >= OUTER_STREAK_VOL_RATIO):
-                    _screen_push("INNERSTREAK", "內盤連續賣單", 180)
-                # 連續二分鐘內盤大量成交：最近 120 秒內盤累計 >= 300 張
+                # ---- 盤中級（180 秒冷卻；定義原則見 SCREEN_SIGNALS.md，XQ 有定義者從 XQ）----
+                # 主力吃貨（XQ）：每筆買張／每筆賣張 >= 2；筆數約掉後等於當日累計外盤量／內盤量
+                # 主力出貨（XQ）：同比值 <= 0.5（取代原內盤連續賣單，該訊號不在截圖內）
+                outer_day = DAY_OUTER_LOTS.get(sym, 0)
+                inner_day = DAY_INNER_LOTS.get(sym, 0)
+                if inner_day > 0 and outer_day / inner_day >= 2:
+                    _screen_push("EAT", "主力吃貨", 180)
+                if inner_day > 0 and outer_day / inner_day <= 0.5:
+                    _screen_push("SHIP", "主力出貨", 180)
+                # 連續二分鐘內盤大量成交：最近 120 秒內盤累計 >= 300 張（截圖字面定義，XQ 附錄無此項）
                 inner_2m = sum(s["step_lots"] for s in hist if s.get("is_inner") and (now_ts - s["ts"]) <= 120)
                 if inner_2m >= 300:
                     _screen_push("INNER2M", "連續二分鐘內盤大量成交", 180)
-                # 連續三分鐘大量成交：最近 3 個 60 秒桶每桶 >= 100 張
-                buckets = [0, 0, 0]
-                for s in hist:
-                    age = now_ts - s["ts"]
-                    if age <= 60:
-                        buckets[2] += s["step_lots"]
-                    elif age <= 120:
-                        buckets[1] += s["step_lots"]
-                    elif age <= 180:
-                        buckets[0] += s["step_lots"]
-                if all(b >= 100 for b in buckets):
-                    _screen_push("VOL3M", "連續三分鐘大量成交", 180)
-                # 瞬間巨量大於 300 張：單拍 10 秒內成交量差 >= 300 張（不分內外盤）
+                # 瞬間巨量大於 300 張（XQ：單筆成交量>300張，開盤首價／收盤末價不算；程式以單拍10秒量差近似，首拍量差本為0故開盤首價已排除）
                 if delta_step_lots >= 300:
                     _screen_push("MEGA300", "瞬間巨量大於300張", 180)
-                # 主力吃貨：5 分鐘內外盤累計 >= 300 張且達 5K 均量 1.6 倍，但當日漲幅 < 2%（還沒拉起來、默默吃）
-                outer_5m = sum(s["step_lots"] for s in hist if s.get("is_outer"))
-                if outer_5m >= 300 and (outer_5m / avg_5k_lots) >= 1.6 and day_pct < 2.0:
-                    _screen_push("EAT", "主力吃貨", 180)
-                # 一分鐘內跌 2% 以上：現價較 60 秒前那拍跌 >= 2%
+                # 一分鐘內跌 2% 以上（XQ：一分鐘內價位下跌達2%以上）：現價較 60 秒前那拍跌 >= 2%
                 snap_60 = None
                 for s in hist:
                     if (now_ts - s["ts"]) >= 60:
                         snap_60 = s
                 if snap_60 is not None and snap_60["price"] > 0 and cur_price <= snap_60["price"] * 0.98:
                     _screen_push("DROP1M", "一分鐘內跌2%以上", 180)
-                # 急拉平盤整理：5 分鐘視窗高低差 <= 1%（平盤整理）且現價自視窗低點急拉 >= 1.5%（純價型，不含成交量條件）
+                # 一分鐘量漲 2% 以上（截圖原文）：最近 60 秒量較前一個 60 秒漲 >= 2%（前 60 秒量 >= 100 張才算）
+                vol_now_60 = sum(s["step_lots"] for s in hist if (now_ts - s["ts"]) <= 60)
+                vol_prev_60 = sum(s["step_lots"] for s in hist if 60 < (now_ts - s["ts"]) <= 120)
+                if vol_prev_60 >= 100 and vol_now_60 >= vol_prev_60 * 1.02:
+                    _screen_push("VOLRISE", "一分鐘量漲2%以上", 180)
+                # 急拉平盤整理（截圖字面定義，XQ 附錄無此項）：5 分鐘視窗高低差 <= 1% 且現價自視窗低點急拉 >= 1.5%
                 win_prices = [s["price"] for s in hist]
                 if win_prices:
                     w_low = min(win_prices)
                     w_high = max(win_prices)
                     if w_low > 0 and ((w_high - w_low) / w_low) <= 0.01 and cur_price >= w_low * 1.015:
                         _screen_push("FLATSURGE", "急拉平盤整理", 180)
+                # 暴量股（XQ 近似版）：股價上漲＋五日均量>2000張＋當日累計量 >= 5×五日均量×已過交易時間比例
+                # （以時間比例代理「過去五日同一時間平均成交量」；XQ 另有「優於大盤」條件，因無大盤資料未實作）
+                if day_pct > 0:
+                    avg_day = AVG_DAILY_LOTS.get(sym, 0)
+                    mins_open = (now_tw.hour - 9) * 60 + now_tw.minute
+                    if avg_day > 2000 and mins_open >= 1 and cur_lots >= 5 * avg_day * (mins_open / 270.0):
+                        _screen_push("BOOM", "暴量股", 180)
             except Exception:
                 pass
 
@@ -639,7 +672,7 @@ def main():
         f"1️⃣ 10執行緒併發，全市場掃描從 61秒 壓縮至 **3~5秒**！\n"
         f"2️⃣ 巡邏密度提升至 **每 10 秒一次**！\n"
         f"3️⃣ 新增 **【🎯外盤連續大買單】** 策略，主力一吃外盤立刻抓起漲！\n"
-        f"4️⃣ 新增 **【📋截圖訊號 13 項】**：均線突破／趨勢線／內盤賣單／當日新高低等同步偵測！"
+        f"4️⃣ 新增 **【📋截圖訊號 15 項】**：均線突破／趨勢線／主力出貨／當日新高低等同步偵測！"
     )
 
     last_hb_slot = None
