@@ -515,10 +515,15 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
                     _screen_push("EAT", "主力吃貨", 180)
                 if inner_day > 0 and outer_day / inner_day <= 0.5:
                     _screen_push("SHIP", "主力出貨", 180)
-                # 連續二分鐘內盤大量成交：最近 120 秒內盤累計 >= 300 張（截圖字面定義，XQ 附錄無此項）
-                inner_2m = sum(s["step_lots"] for s in hist if s.get("is_inner") and (now_ts - s["ts"]) <= 120)
-                if inner_2m >= 300:
-                    _screen_push("INNER2M", "連續二分鐘內盤大量成交", 180)
+                # 連續三筆內盤成交（截圖第 9 項；外盤連續買策略 B 的鏡像）：最近 3 拍中 >= 2 拍內盤、每拍 >= 20 張、合計 >= 150 張且達 5K 均量 1.6 倍、60 秒內，且現價不高于首拍價
+                recent3_i = list(hist)[-3:]
+                inner_hits = [s for s in recent3_i if s.get("is_inner") and s["step_lots"] >= 20]
+                inner_sum = sum(s["step_lots"] for s in inner_hits)
+                inner_ratio = inner_sum / avg_5k_lots
+                inner_window_ok = (now_ts - recent3_i[0]["ts"]) <= OUTER_STREAK_WINDOW_SEC
+                if (inner_window_ok and len(inner_hits) >= OUTER_STREAK_COUNT and inner_sum >= OUTER_STREAK_MIN_LOTS
+                        and inner_ratio >= OUTER_STREAK_VOL_RATIO and cur_price <= recent3_i[0]["price"]):
+                    _screen_push("INNER3", "連續三筆內盤成交", 180)
                 # 瞬間巨量大於 300 張（XQ：單筆成交量>300張，開盤首價／收盤末價不算；程式以單拍10秒量差近似，首拍量差本為0故開盤首價已排除）
                 if delta_step_lots >= 300:
                     _screen_push("MEGA300", "瞬間巨量大於300張", 180)
@@ -550,7 +555,7 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
                 pass
 
             # =========================================================================
-            # 🎯 策略一：【外盤連續大買單（主力主動吃貨雷達）】— 抓起漲第一秒！
+            # 🎯 策略一：【連續三筆外盤成交（截圖第 5 項；原名外盤連續大買單，邏輯不變）】— 抓起漲第一秒！
             # 檢查最近 3 個取樣點 (約 20~30 秒內) 是否連續出現外盤大單掃貨
             # =========================================================================
             recent_snaps = list(hist)[-3:]
@@ -580,7 +585,7 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
                         "priority": 2 if clean_code in FUTURES_SET else 1,
                         "vol_ratio": outer_vol_ratio,
                         "msg": (
-                            f"{stock_name}（{clean_code}）外盤連續買單\n"
+                            f"{stock_name}（{clean_code}）連續三筆外盤成交\n"
                             f"時間：{now_tw.strftime('%H:%M:%S')}"
                         )
                     })
