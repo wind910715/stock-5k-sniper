@@ -54,6 +54,10 @@ LAST_ALERT_ANY = {}          # 每檔股票「任一策略」最後推播時間 
 ALERT_COUNT_TODAY = {}       # 每檔股票當日推播次數 (程序每日重啟，天然以日為界)
 LIMIT9_ALERTED = set()       # 9% 即將漲停／跌停警示：每檔每日每方向只發一次 (sym, "UP"/"DOWN")，獨立於 5K／外盤冷卻與單日上限
 
+# 2026-10-30 使用者定：TG 推播偏多訊號名前加 🟢，偏空不加 🔴（不加任何符號）。
+# 截圖訊號以 tag 查表；MEGA300（瞬間巨量）定義本身不帶方向，呼叫時以本拍內外盤判定傳 long_bias。
+SCREEN_LONG_TAGS = {"MA20BRK", "MABIND", "DOWNTRENDBRK", "DAYHIGH", "EAT", "RISE1M", "FLATSURGE", "BOOM"}
+
 # 【截圖訊號擴充】2026-10-28 使用者定：截圖清單訊號直接寫入程式，明日偵測用（定義見 SCREEN_SIGNALS.md）
 MA_DICT = {}               # sym -> (ma5, ma10, ma20, ma60, ma120) 日線均線（暖機算好，ma60/ma120 算不出來為 None，該檔跳過糾集區訊號）
 TREND_DICT = {}            # sym -> (slope, trend_today) 20 日高點最小平方法回歸趨勢線
@@ -408,7 +412,7 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
                     "priority": 2 if clean_code in FUTURES_SET else 1,
                     "vol_ratio": abs(day_pct),
                     "msg": (
-                        f"{stock_name}（{clean_code}）即將漲停\n"
+                        f"🟢{stock_name}（{clean_code}）即將漲停\n"
                         f"時間：{now_tw.strftime('%H:%M:%S')}"
                     )
                 })
@@ -431,7 +435,7 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
             # 位置刻意放在外盤／5K 區塊之前：那兩段結尾有 continue，放在後面會被跳過
             # =========================================================================
             try:
-                def _screen_push(tag, label, cooldown_sec, once_per_day=False):
+                def _screen_push(tag, label, cooldown_sec, once_per_day=False, long_bias=None):
                     key = f"{sym}_{tag}"
                     if once_per_day:
                         if key in DAY_SCREEN_ALERTED:
@@ -445,11 +449,14 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
                     else:
                         ALERTED_COOLDOWN[key] = now_ts
                     _register_alert(sym, now_ts)
+                    # 2026-10-30 使用者定：偏多名前加 🟢，偏空不加 🔴；long_bias 指定時優先（MEGA300 用）。
+                    is_long = long_bias if long_bias is not None else tag in SCREEN_LONG_TAGS
+                    prefix = "🟢" if is_long else ""
                     alerts.append({
                         "priority": 2 if clean_code in FUTURES_SET else 1,
                         "vol_ratio": 0,
                         "msg": (
-                            f"{stock_name}（{clean_code}）{label}\n"
+                            f"{prefix}{stock_name}（{clean_code}）{label}\n"
                             f"時間：{now_tw.strftime('%H:%M:%S')}"
                         )
                     })
@@ -525,8 +532,9 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
                         and inner_ratio >= OUTER_STREAK_VOL_RATIO and cur_price <= recent3_i[0]["price"]):
                     _screen_push("INNER3", "連續三筆內盤成交", 180)
                 # 瞬間巨量大於 300 張（XQ：單筆成交量>300張，開盤首價／收盤末價不算；程式以單拍10秒量差近似，首拍量差本為0故開盤首價已排除）
+                # 2026-10-30 使用者定：瞬間巨量以本拍內外盤分方向（外盤→偏多加 🟢，內盤／無法判定→不加）。
                 if delta_step_lots >= 300:
-                    _screen_push("MEGA300", "瞬間巨量大於300張", 180)
+                    _screen_push("MEGA300", "瞬間巨量大於300張", 180, long_bias=is_outer_buy)
                 # 一分鐘內跌 2% 以上（XQ：一分鐘內價位下跌達2%以上）：現價較 60 秒前那拍跌 >= 2%
                 snap_60 = None
                 for s in hist:
@@ -585,7 +593,7 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
                         "priority": 2 if clean_code in FUTURES_SET else 1,
                         "vol_ratio": outer_vol_ratio,
                         "msg": (
-                            f"{stock_name}（{clean_code}）連續三筆外盤成交\n"
+                            f"🟢{stock_name}（{clean_code}）連續三筆外盤成交\n"
                             f"時間：{now_tw.strftime('%H:%M:%S')}"
                         )
                     })
@@ -626,7 +634,7 @@ def run_realtime_scan(send_hb_now=False, is_manual_test=False):
                     "priority": 2 if clean_code in FUTURES_SET else 1,
                     "vol_ratio": vol_ratio_5k,
                     "msg": (
-                        f"{stock_name}（{clean_code}）5k爆量買單\n"
+                        f"🟢{stock_name}（{clean_code}）5k爆量買單\n"
                         f"時間：{now_tw.strftime('%H:%M:%S')}"
                     )
                 })
